@@ -1,0 +1,163 @@
+========================================
+Route Planner AI – Installation Guide
+========================================
+
+This guide explains how to install and run the Route Planner AI
+on a Windows computer from scratch.
+
+System Requirements
+-------------------
+- Windows 10 or Windows 11
+- Internet connection
+- Administrator access (recommended)
+
+========================================
+STEP 1 – Install Python (Recommended: Winget)
+========================================
+
+1. Open PowerShell as Administrator.
+
+2. Run:
+
+   winget install -e --id Python.Python.3.12
+
+This installs the official 64-bit Python 3.12 release.
+
+3. Close PowerShell and open a NEW PowerShell window.
+
+4. Verify installation:
+
+   python --version
+   pip --version
+
+Both commands should return version numbers.
+
+5. Upgrade pip (recommended):
+
+   python -m pip install --upgrade pip
+
+----------------------------------------
+If winget is not available:
+----------------------------------------
+
+1. Go to:
+   https://www.python.org/downloads/
+
+2. Download Python 3.12 (64-bit).
+
+3. IMPORTANT:
+   Check the box:
+   [✓] Add Python to PATH
+
+4. Click Install.
+
+========================================
+STEP 2 – Place the Program Folder
+========================================
+
+1. Create this folder:
+
+   C:\RoutePlanner
+
+2. Copy the folder:
+
+   route_planner_ai
+
+   into:
+
+   C:\RoutePlanner
+
+You should now have:
+
+   C:\RoutePlanner\route_planner_ai
+
+========================================
+STEP 3 – Create Virtual Environment
+========================================
+
+Open PowerShell and run:
+
+   cd C:\RoutePlanner
+   python -m venv .venv
+   .\.venv\Scripts\activate
+   python -m pip install --upgrade pip
+   pip install -r .\route_planner_ai\requirements.txt
+
+Wait for all packages to finish installing.
+
+========================================
+STEP 4 – Add API Keys
+========================================
+
+Inside this folder:
+
+   C:\RoutePlanner\route_planner_ai
+
+Create a file named:
+
+   .env
+
+Add the following lines (replace with real keys):
+
+   ORS_API_KEY=YOUR_ORS_KEY_HERE
+   TOMTOM_API_KEY=YOUR_TOMTOM_KEY_HERE
+
+Save the file.
+
+Make sure the file name is exactly:
+
+   .env
+
+and NOT:
+
+   .env.txt
+
+========================================
+STEP 5 – Run the Application
+========================================
+
+In PowerShell:
+
+   cd C:\RoutePlanner
+   .\.venv\Scripts\activate
+   python -m route_planner_ai.app
+
+The Route Planner window should open.
+
+========================================
+OPTIONAL – Create One-Click Launcher
+========================================
+
+Create a file on the Desktop called:
+
+   RunRoutePlanner.bat
+
+Paste the following into it:
+
+   @echo off
+   cd /d C:\RoutePlanner
+   call .\.venv\Scripts\activate
+   python -m route_planner_ai.app
+   pause
+
+Double-click this file to launch the program.
+
+========================================
+Troubleshooting
+========================================
+
+If you see:
+   ModuleNotFoundError
+
+Make sure:
+- You activated the virtual environment
+- You ran the pip install command
+
+If routing fails:
+- Verify the .env file exists
+- Verify API keys are correct
+- Check internet connection
+
+========================================
+End of Installation Guide
+========================================
