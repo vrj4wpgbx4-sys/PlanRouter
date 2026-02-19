@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from math import floor
 from pathlib import Path
 import json
@@ -9,7 +9,7 @@ import sys
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QUrl, QObject, Signal, QRunnable, QThreadPool
+from PySide6.QtCore import Qt, QUrl, QObject, Signal, QRunnable, QThreadPool, QTime, QDate
 from PySide6.QtWidgets import (
     QApplication,
     QWidget,
@@ -26,6 +26,8 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QComboBox,
     QSpinBox,
+    QTimeEdit,
+    QDateEdit,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
@@ -342,6 +344,23 @@ class MainWindow(QMainWindow):
         speed_row.addStretch(1)
         left_layout.addLayout(speed_row)
 
+        # Departure date/time (Driver mode only)
+        depart_row = QHBoxLayout()
+        depart_label = QLabel("Departure (date/time):")
+        self.depart_date_edit = QDateEdit()
+        self.depart_date_edit.setCalendarPopup(True)
+        self.depart_date_edit.setDate(QDate.currentDate())
+
+        self.depart_time_edit = QTimeEdit()
+        self.depart_time_edit.setDisplayFormat("HH:mm")
+        self.depart_time_edit.setTime(QTime.currentTime())
+
+        depart_row.addWidget(depart_label)
+        depart_row.addWidget(self.depart_date_edit)
+        depart_row.addWidget(self.depart_time_edit)
+        depart_row.addStretch(1)
+        left_layout.addLayout(depart_row)
+
         form = QFormLayout()
         self.origin_input = QLineEdit()
         self.origin_input.setPlaceholderText("Origin (City, ST / address / ZIP)")
@@ -422,6 +441,9 @@ class MainWindow(QMainWindow):
 
         # Initialize map
         self._load_map()
+
+        # Initialize departure controls state based on mode
+        self._update_depart_controls_enabled()
 
     # -------------------------
     # Map
@@ -565,13 +587,18 @@ class MainWindow(QMainWindow):
     # Mode / speed
     # -------------------------
 
+    def _update_depart_controls_enabled(self) -> None:
+        enabled = self._mode == "driver"
+        self.depart_date_edit.setEnabled(enabled)
+        self.depart_time_edit.setEnabled(enabled)
+
     def _on_mode_changed(self, index: int) -> None:
         text = self.mode_combo.currentText().strip().lower()
         if text.startswith("driver"):
             self._mode = "driver"
         else:
             self._mode = "dispatcher"
-        # Currently, mode lightly affects reporting only.
+        self._update_depart_controls_enabled()
 
     def _on_speed_changed(self, value: int) -> None:
         self._avg_speed_mph = int(value)
@@ -820,20 +847,35 @@ class MainWindow(QMainWindow):
                 f"- Route {idx + 1}: {miles:.1f} miles — Risk {label} ({score}/100); {expl}\n"
             )
 
-        # Driver-only ETA block using average speed
+        # Driver-only ETA block using average speed and departure date/time
         driver_block = ""
         if self._mode == "driver" and miles_primary > 0 and self._avg_speed_mph > 0:
             travel_hours = miles_primary / float(self._avg_speed_mph)
-            eta_dt = now + timedelta(hours=travel_hours)
+            try:
+                qd = self.depart_date_edit.date()
+                qt = self.depart_time_edit.time()
+                depart_dt = datetime(
+                    year=qd.year(),
+                    month=qd.month(),
+                    day=qd.day(),
+                    hour=qt.hour(),
+                    minute=qt.minute(),
+                )
+            except Exception:
+                depart_dt = now
+
+            eta_dt = depart_dt + timedelta(hours=travel_hours)
             eta_str = eta_dt.strftime("%Y-%m-%d %H:%M")
             eta_h = int(travel_hours)
             eta_m = int(round((travel_hours - eta_h) * 60))
+            depart_str = depart_dt.strftime("%Y-%m-%d %H:%M")
 
             driver_block = (
                 "\nDriver view (based on average speed):\n"
                 f"- Average speed: {self._avg_speed_mph} mph\n"
+                f"- Planned departure: {depart_str}\n"
                 f"- Approx driving time at this speed: {eta_h}h {eta_m}m\n"
-                f"- Estimated arrival time (assuming departure at dispatch timestamp): {eta_str}\n"
+                f"- Estimated arrival time: {eta_str}\n"
             )
 
         conditions_ver = CONDITIONS_CLIENT_VERSION or "unknown"
