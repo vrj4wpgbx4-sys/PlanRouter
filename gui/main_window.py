@@ -849,20 +849,26 @@ class MainWindow(QMainWindow):
 
         # Driver-only ETA block using average speed and departure date/time
         driver_block = ""
+        eta_weather_block = ""
+
         if self._mode == "driver" and miles_primary > 0 and self._avg_speed_mph > 0:
             travel_hours = miles_primary / float(self._avg_speed_mph)
+
+            # Build timezone-aware departure datetime (local timezone)
             try:
                 qd = self.depart_date_edit.date()
                 qt = self.depart_time_edit.time()
+                local_tz = datetime.now().astimezone().tzinfo
                 depart_dt = datetime(
                     year=qd.year(),
                     month=qd.month(),
                     day=qd.day(),
                     hour=qt.hour(),
                     minute=qt.minute(),
+                    tzinfo=local_tz,
                 )
             except Exception:
-                depart_dt = now
+                depart_dt = datetime.now().astimezone()
 
             eta_dt = depart_dt + timedelta(hours=travel_hours)
             eta_str = eta_dt.strftime("%Y-%m-%d %H:%M")
@@ -877,6 +883,62 @@ class MainWindow(QMainWindow):
                 f"- Approx driving time at this speed: {eta_h}h {eta_m}m\n"
                 f"- Estimated arrival time: {eta_str}\n"
             )
+
+            # Time-aligned weather forecast for Driver mode, if supported by ConditionsClient
+            try:
+                # Derive origin/destination coordinates from primary route geometry
+                origin_lat = origin_lon = dest_lat = dest_lon = None
+                if isinstance(geom, dict) and isinstance(geom.get("coordinates"), list):
+                    coords = geom.get("coordinates") or []
+                    if len(coords) >= 2:
+                        o = coords[0]
+                        d = coords[-1]
+                        if isinstance(o, (list, tuple)) and len(o) == 2:
+                            origin_lon, origin_lat = float(o[0]), float(o[1])
+                        if isinstance(d, (list, tuple)) and len(d) == 2:
+                            dest_lon, dest_lat = float(d[0]), float(d[1])
+
+                if (
+                    origin_lat is not None
+                    and origin_lon is not None
+                    and dest_lat is not None
+                    and dest_lon is not None
+                    and hasattr(ConditionsClient, "get_route_weather_with_eta")
+                ):
+                    conds = ConditionsClient()
+                    eta_midpoint = depart_dt + timedelta(hours=travel_hours / 2.0)
+
+                    try:
+                        eta_weather_text = conds.get_route_weather_with_eta(
+                            origin_lat=origin_lat,
+                            origin_lon=origin_lon,
+                            dest_lat=dest_lat,
+                            dest_lon=dest_lon,
+                            eta_midpoint=eta_midpoint,
+                            eta_destination=eta_dt,
+                        )
+                    except ConditionsError as e:
+                        stamp = (
+                            f" [{CONDITIONS_CLIENT_VERSION}]"
+                            if CONDITIONS_CLIENT_VERSION
+                            else ""
+                        )
+                        eta_weather_text = (
+                            f"Time-aligned weather forecast unavailable{stamp}:\n{e}"
+                        )
+
+                    eta_weather_block = "\n" + eta_weather_text + "\n"
+
+            except Exception as e:
+                stamp = (
+                    f" [{CONDITIONS_CLIENT_VERSION}]"
+                    if CONDITIONS_CLIENT_VERSION
+                    else ""
+                )
+                eta_weather_block = (
+                    f"\nTime-aligned weather forecast unavailable{stamp}:\n"
+                    f"{type(e).__name__}: {e}\n"
+                )
 
         conditions_ver = CONDITIONS_CLIENT_VERSION or "unknown"
         policy_footer = (
@@ -915,6 +977,7 @@ class MainWindow(QMainWindow):
             + f"{risk_text_primary}\n"
             + (actions_block + "\n" if actions_block else "")
             + driver_block
+            + eta_weather_block
             + recommended_block
             + "\n"
             + f"Route comparison summary for: {origin} → {destination}\n"
