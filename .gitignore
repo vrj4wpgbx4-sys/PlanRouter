@@ -1,4 +1,4 @@
-# Python
+# Python bytecode
 __pycache__/
 *.pyc
 *.pyo
@@ -9,15 +9,17 @@ __pycache__/
 venv/
 env/
 
-# SQLite database
+# SQLite databases (runtime / cache)
 *.sqlite
+*.sqlite3
 *.db
+route_planner_cache.sqlite3
 
 # OS files
 .DS_Store
 Thumbs.db
 
-# IDE
+# IDE / editor config
 .vscode/
 .idea/
 
@@ -25,3 +27,6 @@ Thumbs.db
 build/
 dist/
 *.spec
+
+# Local environment / secrets (if present)
+.env
