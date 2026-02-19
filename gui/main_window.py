@@ -84,6 +84,7 @@ class PlanInput:
     origin: str
     destination: str
     stops: List[str]
+    mode: str = "dispatcher"
 
 
 @dataclass
@@ -109,6 +110,7 @@ class PlanWorker(QRunnable):
         origin = self.payload.origin
         destination = self.payload.destination
         stops = self.payload.stops
+        mode = getattr(self.payload, "mode", "dispatcher")
 
         try:
             self.signals.started.emit("Contacting routing service...")
@@ -134,11 +136,21 @@ class PlanWorker(QRunnable):
             self.signals.started.emit("Planning route(s)...")
             try:
                 if stops and hasattr(client, "get_route_with_stops"):
+                    # Multi-drop behavior stays unchanged for now (no alternatives toggle).
                     plan = client.get_route_with_stops(origin, stops, destination)  # type: ignore
                     stop_based = True
                 else:
-                    plan = client.get_routes(origin, destination)
                     stop_based = False
+                    # Phase 2: In Driver mode, attempt to request provider alternatives if supported.
+                    if mode == "driver":
+                        try:
+                            # Prefer a keyword argument pattern; fall back cleanly if unsupported.
+                            plan = client.get_routes(origin, destination, alternatives=True)  # type: ignore
+                        except TypeError:
+                            # Older signatures without 'alternatives' kwarg.
+                            plan = client.get_routes(origin, destination)
+                    else:
+                        plan = client.get_routes(origin, destination)
 
                 routes = plan.get("routes", []) or []
                 toll_info = plan.get("toll", {"available": False}) or {"available": False}
@@ -630,7 +642,7 @@ class MainWindow(QMainWindow):
         # Clear map on new run
         self._push_map({"type": "LineString", "coordinates": []}, [])
 
-        worker = PlanWorker(PlanInput(origin=origin, destination=destination, stops=stops))
+        worker = PlanWorker(PlanInput(origin=origin, destination=destination, stops=stops, mode=self._mode))
         worker.signals.started.connect(self._on_worker_status)
         worker.signals.failed.connect(self._on_worker_failed)
         worker.signals.finished.connect(self._on_worker_finished)
@@ -672,7 +684,18 @@ class MainWindow(QMainWindow):
             minutes = float(summary.get("duration_minutes", 0.0) or 0.0)
             hours = floor(minutes / 60) if minutes else 0
             mins = int(round(minutes - hours * 60)) if minutes else 0
-            self.route_list.addItem(f"Route {idx + 1} - {miles:.1f} miles, {hours}h {mins}m")
+
+            if self._mode == "driver":
+                if idx == 0:
+                    prefix = "Route 1 (Primary)"
+                elif idx == 1:
+                    prefix = "Route 2 (Alternate)"
+                else:
+                    prefix = f"Route {idx + 1}"
+            else:
+                prefix = f"Route {idx + 1}"
+
+            self.route_list.addItem(f"{prefix} - {miles:.1f} miles, {hours}h {mins}m")
 
         if self._current_routes:
             self.route_list.setCurrentRow(0)
@@ -811,8 +834,18 @@ class MainWindow(QMainWindow):
             expl = str(pr.get("risk_explanation", ""))
             actions = pr.get("risk_actions", []) or []
 
+            if self._mode == "driver":
+                if idx == 0:
+                    route_name = "Route 1 (Primary)"
+                elif idx == 1:
+                    route_name = "Route 2 (Alternate)"
+                else:
+                    route_name = f"Route {idx + 1}"
+            else:
+                route_name = f"Route {idx + 1}"
+
             route_lines.append(
-                f"- Route {idx + 1}: {miles:.1f} miles, {hours}h {mins}m — "
+                f"- {route_name}: {miles:.1f} miles, {hours}h {mins}m — "
                 f"Risk {label} ({score}/100); {expl}"
             )
 
@@ -842,9 +875,19 @@ class MainWindow(QMainWindow):
         recommended_block = ""
         if best_choice:
             score, miles, idx, label, expl = best_choice
+            if self._mode == "driver":
+                if idx == 0:
+                    best_name = "Route 1 (Primary)"
+                elif idx == 1:
+                    best_name = "Route 2 (Alternate)"
+                else:
+                    best_name = f"Route {idx + 1}"
+            else:
+                best_name = f"Route {idx + 1}"
+
             recommended_block = (
                 "\nRecommended route (based on lowest risk, then shortest distance):\n"
-                f"- Route {idx + 1}: {miles:.1f} miles — Risk {label} ({score}/100); {expl}\n"
+                f"- {best_name}: {miles:.1f} miles — Risk {label} ({score}/100); {expl}\n"
             )
 
         # Driver-only ETA block using average speed and departure date/time
@@ -945,7 +988,7 @@ class MainWindow(QMainWindow):
             "\n\nPolicy & System Context:\n"
             "- Routing provider: OpenRouteService (ORS) directions (GeoJSON)\n"
             "- ORS profile: driving-hgv\n"
-            "- Alternatives: disabled (HGV default)\n"
+            "- Alternatives: dispatcher: disabled; driver: attempts provider alternatives if supported\n"
             f"- Sanity threshold: {threshold}×\n"
             "- Geocoding: ORS Pelias\n"
             f"- Weather: Open-Meteo (ConditionsClient {conditions_ver})\n"
@@ -965,7 +1008,7 @@ class MainWindow(QMainWindow):
 
         return (
             header
-            + f"Route: {origin} → {destination}\n\n"
+            + f"Route: {origin} \u2192 {destination}\n\n"
             + "Primary route:\n"
             + f"- Distance: {miles_primary:.1f} miles\n"
             + f"- Estimated drive time: {hours_primary}h {mins_primary}m\n"
@@ -980,7 +1023,7 @@ class MainWindow(QMainWindow):
             + eta_weather_block
             + recommended_block
             + "\n"
-            + f"Route comparison summary for: {origin} → {destination}\n"
+            + f"Route comparison summary for: {origin} \u2192 {destination}\n"
             + "\n".join(route_lines)
             + policy_footer
         )
