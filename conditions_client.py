@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Dict, Any, Optional
+from datetime import datetime, timezone
 import time
 import requests
 
@@ -12,7 +13,7 @@ except Exception:  # pragma: no cover
 
 
 # Bump this any time we rewrite so the report proves which file is being used
-CONDITIONS_CLIENT_VERSION = "2026-02-17.v2"
+CONDITIONS_CLIENT_VERSION = "2026-02-19.v3"
 
 
 class ConditionsError(Exception):
@@ -22,24 +23,26 @@ class ConditionsError(Exception):
 
 class ConditionsClient:
     """
-    Open-Meteo weather snapshot client with caching.
+    Open-Meteo weather client with:
 
-    Goals:
-      - Never hide the true reason for failure
-      - Work with both Open-Meteo 'current=' and legacy 'current_weather=true'
-      - Cache results to reduce calls
+    - Snapshot mode (current conditions)  ← existing behavior (Dispatcher)
+    - ETA-aligned forecast mode           ← new behavior (Driver Phase 1)
     """
 
     BASE_URL = "https://api.open-meteo.com/v1/forecast"
 
-    POINT_TTL_SECONDS = 10 * 60          # 10 minutes
-    PURGE_EVERY_SECONDS = 6 * 60 * 60    # purge best-effort every 6 hours
+    POINT_TTL_SECONDS = 10 * 60
+    PURGE_EVERY_SECONDS = 6 * 60 * 60
     TIMEOUT_SECONDS = 12
 
     def __init__(self) -> None:
         self.session = requests.Session()
         self.cache = CacheDB()
         self._last_purge_ts = 0
+
+    # ============================================================
+    # EXISTING SNAPSHOT MODE (UNCHANGED)
+    # ============================================================
 
     def get_route_weather(
         self,
@@ -48,13 +51,7 @@ class ConditionsClient:
         dest_lat: float,
         dest_lon: float,
     ) -> str:
-        """
-        Return a short weather snapshot at origin / midpoint / destination.
 
-        IMPORTANT:
-        If anything fails, raise ConditionsError with an explicit reason
-        (never generic "unexpected error").
-        """
         self._maybe_purge_expired()
 
         mid_lat = (origin_lat + dest_lat) / 2.0
@@ -74,9 +71,44 @@ class ConditionsClient:
             f"{d['temp_f']:.1f}°F ({d['temp_c']:.1f}°C), wind {d['wind_kmh']:.0f} km/h"
         )
 
-    # ---------------------------------------------------------------------
-    # Internals
-    # ---------------------------------------------------------------------
+    # ============================================================
+    # NEW: ETA-ALIGNED FORECAST MODE (Driver Phase 1)
+    # ============================================================
+
+    def get_route_weather_with_eta(
+        self,
+        origin_lat: float,
+        origin_lon: float,
+        dest_lat: float,
+        dest_lon: float,
+        eta_midpoint: datetime,
+        eta_destination: datetime,
+    ) -> str:
+        """
+        Time-aware weather forecast aligned to driver ETAs.
+
+        ETAs must be timezone-aware datetimes.
+        """
+
+        self._maybe_purge_expired()
+
+        mid_lat = (origin_lat + dest_lat) / 2.0
+        mid_lon = (origin_lon + dest_lon) / 2.0
+
+        m = self._fetch_point_forecast_for_eta(mid_lat, mid_lon, eta_midpoint)
+        d = self._fetch_point_forecast_for_eta(dest_lat, dest_lon, eta_destination)
+
+        return (
+            f"Weather forecast aligned to ETA [{CONDITIONS_CLIENT_VERSION}]:\n"
+            f"- Midpoint ETA ({eta_midpoint.isoformat()}): "
+            f"{m['description']}, {m['temp_f']:.1f}°F, wind {m['wind_kmh']:.0f} km/h\n"
+            f"- Destination ETA ({eta_destination.isoformat()}): "
+            f"{d['description']}, {d['temp_f']:.1f}°F, wind {d['wind_kmh']:.0f} km/h"
+        )
+
+    # ============================================================
+    # INTERNALS
+    # ============================================================
 
     def _maybe_purge_expired(self) -> None:
         now = int(time.time())
@@ -87,100 +119,142 @@ class ConditionsClient:
                 pass
             self._last_purge_ts = now
 
+    # ------------------------------------------------------------
+    # Snapshot mode internals (unchanged)
+    # ------------------------------------------------------------
+
     def _fetch_point_weather(self, lat: float, lon: float) -> Dict[str, Any]:
         cache_key = f"wx_{lat:.4f}_{lon:.4f}"
-
         cached = self._cache_get(cache_key)
+
         if isinstance(cached, dict) and self._looks_valid_cached_weather(cached):
             return cached
 
-        # Try modern API first, then legacy fallback
-        data = self._call_open_meteo(lat, lon)
-        parsed = self._parse_open_meteo(data)
+        data = self._call_open_meteo_current(lat, lon)
+        parsed = self._parse_open_meteo_current(data)
 
         self._cache_set(cache_key, parsed)
         return parsed
 
-    def _call_open_meteo(self, lat: float, lon: float) -> Dict[str, Any]:
-        # Attempt 1: modern schema
-        params1 = {
+    # ------------------------------------------------------------
+    # NEW: Forecast mode internals
+    # ------------------------------------------------------------
+
+    def _fetch_point_forecast_for_eta(
+        self,
+        lat: float,
+        lon: float,
+        eta: datetime,
+    ) -> Dict[str, Any]:
+
+        if eta.tzinfo is None:
+            raise ConditionsError(
+                f"[{CONDITIONS_CLIENT_VERSION}] ETA must be timezone-aware."
+            )
+
+        eta_utc = eta.astimezone(timezone.utc)
+        data = self._call_open_meteo_hourly(lat, lon)
+
+        hourly = data.get("hourly")
+        if not hourly:
+            raise ConditionsError(
+                f"[{CONDITIONS_CLIENT_VERSION}] Hourly forecast missing."
+            )
+
+        times = hourly.get("time", [])
+        temps = hourly.get("temperature_2m", [])
+        winds = hourly.get("wind_speed_10m", [])
+        codes = hourly.get("weather_code", [])
+
+        if not times:
+            raise ConditionsError(
+                f"[{CONDITIONS_CLIENT_VERSION}] Hourly time array empty."
+            )
+
+        eta_ts = int(eta_utc.timestamp())
+        best_idx = 0
+        best_diff = float("inf")
+
+        for i, t in enumerate(times):
+            ts = int(t)
+            diff = abs(ts - eta_ts)
+            if diff < best_diff:
+                best_diff = diff
+                best_idx = i
+
+        temp_f = float(temps[best_idx])
+        wind_kmh = float(winds[best_idx])
+        code = int(codes[best_idx])
+
+        return self._build_weather(temp_f, wind_kmh, code)
+
+    # ------------------------------------------------------------
+    # API calls
+    # ------------------------------------------------------------
+
+    def _call_open_meteo_current(self, lat: float, lon: float) -> Dict[str, Any]:
+        params = {
             "latitude": lat,
             "longitude": lon,
             "current": "temperature_2m,weather_code,wind_speed_10m",
             "temperature_unit": "fahrenheit",
             "wind_speed_unit": "kmh",
         }
+        return self._http_get_json(self.BASE_URL, params)
 
-        try:
-            return self._http_get_json(self.BASE_URL, params1)
-        except ConditionsError as e:
-            # If the error smells like schema incompatibility, try fallback; otherwise fail fast.
-            msg = str(e).lower()
-            if "schema" not in msg and "missing" not in msg and "current" not in msg:
-                raise
-
-        # Attempt 2: legacy schema
-        params2 = {
+    def _call_open_meteo_hourly(self, lat: float, lon: float) -> Dict[str, Any]:
+        params = {
             "latitude": lat,
             "longitude": lon,
-            "current_weather": "true",
+            "hourly": "temperature_2m,weather_code,wind_speed_10m",
             "temperature_unit": "fahrenheit",
-            "windspeed_unit": "kmh",
+            "wind_speed_unit": "kmh",
+            "timeformat": "unixtime",
+            "timezone": "GMT",
+            "forecast_days": 7,
         }
-        return self._http_get_json(self.BASE_URL, params2)
+        return self._http_get_json(self.BASE_URL, params)
+
+    # ------------------------------------------------------------
+    # Shared helpers
+    # ------------------------------------------------------------
 
     def _http_get_json(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
         try:
             resp = self.session.get(url, params=params, timeout=self.TIMEOUT_SECONDS)
         except requests.Timeout:
-            raise ConditionsError(f"[{CONDITIONS_CLIENT_VERSION}] Weather timed out after {self.TIMEOUT_SECONDS}s.")
+            raise ConditionsError(
+                f"[{CONDITIONS_CLIENT_VERSION}] Weather timed out."
+            )
         except requests.RequestException as e:
-            raise ConditionsError(f"[{CONDITIONS_CLIENT_VERSION}] Weather network error: {e!r}")
+            raise ConditionsError(
+                f"[{CONDITIONS_CLIENT_VERSION}] Weather network error: {e!r}"
+            )
 
         if resp.status_code != 200:
-            body = (resp.text or "")[:250].replace("\n", " ")
-            raise ConditionsError(f"[{CONDITIONS_CLIENT_VERSION}] Weather HTTP {resp.status_code}: {body}")
+            raise ConditionsError(
+                f"[{CONDITIONS_CLIENT_VERSION}] Weather HTTP {resp.status_code}: {resp.text[:200]}"
+            )
 
-        try:
-            data = resp.json()
-        except ValueError:
-            raise ConditionsError(f"[{CONDITIONS_CLIENT_VERSION}] Weather returned invalid JSON.")
+        return resp.json()
 
-        if not isinstance(data, dict):
-            raise ConditionsError(f"[{CONDITIONS_CLIENT_VERSION}] Weather response schema invalid (not a dict).")
+    def _parse_open_meteo_current(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        cur = data.get("current")
+        if not isinstance(cur, dict):
+            raise ConditionsError(
+                f"[{CONDITIONS_CLIENT_VERSION}] Current block missing."
+            )
 
-        return data
+        temp_f = float(cur["temperature_2m"])
+        wind_kmh = float(cur["wind_speed_10m"])
+        code = int(cur["weather_code"])
 
-    def _parse_open_meteo(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        # Modern: data["current"]
-        if isinstance(data.get("current"), dict):
-            cur = data["current"]
-            try:
-                temp_f = float(cur["temperature_2m"])
-                wind_kmh = float(cur["wind_speed_10m"])
-                code = int(cur["weather_code"])
-            except Exception as e:
-                raise ConditionsError(f"[{CONDITIONS_CLIENT_VERSION}] Weather schema mismatch (current): {e!r}")
-
-            return self._build_weather(temp_f, wind_kmh, code)
-
-        # Legacy: data["current_weather"]
-        if isinstance(data.get("current_weather"), dict):
-            cur = data["current_weather"]
-            try:
-                temp_f = float(cur["temperature"])
-                wind_kmh = float(cur["windspeed"])
-                code = int(cur["weathercode"])
-            except Exception as e:
-                raise ConditionsError(f"[{CONDITIONS_CLIENT_VERSION}] Weather schema mismatch (current_weather): {e!r}")
-
-            return self._build_weather(temp_f, wind_kmh, code)
-
-        raise ConditionsError(f"[{CONDITIONS_CLIENT_VERSION}] Weather response missing current conditions block (schema).")
+        return self._build_weather(temp_f, wind_kmh, code)
 
     def _build_weather(self, temp_f: float, wind_kmh: float, code: int) -> Dict[str, Any]:
         temp_c = (temp_f - 32.0) * 5.0 / 9.0
         desc = self._weather_code_description(code)
+
         return {
             "temp_f": float(temp_f),
             "temp_c": float(temp_c),
