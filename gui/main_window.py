@@ -1,25 +1,7 @@
-"""
-route_planner_ai/gui/main_window.py
-
-Full rewrite:
-- Import bootstrapping so legacy absolute imports keep working
-- Background worker (QThreadPool) so GUI does not freeze
-- Weather error transparency
-- Risk scoring compatibility: supports 3-return or 4-return signatures
-- Dispatch report includes "Recommended actions" + Policy & System Context footer
-- MAP:
-  - draws route + markers: O, 1..N, D (stops in entered order)
-  - FORCE REFRESH on every plan + selection:
-      * queue payload until web view load finished
-      * always redraw using a nonce
-- UI:
-  - Adds CLEAR button to wipe last route and reset UI for new route entry
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from math import floor
 from pathlib import Path
 import json
@@ -42,43 +24,45 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QSplitter,
     QSizePolicy,
+    QComboBox,
+    QSpinBox,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
+APP_VERSION = "0.1.0"
 
 # -----------------------------------------------------------------------------
-# Import bootstrap
+# Import bootstrap so it works both as a package and as a flat script tree
 # -----------------------------------------------------------------------------
 _pkg_dir = Path(__file__).resolve().parents[1]  # .../route_planner_ai
 if str(_pkg_dir) not in sys.path:
     sys.path.insert(0, str(_pkg_dir))
 
 try:
-    from route_planner_ai.routing_client import RoutingClient, RoutingError  # type: ignore
-except Exception:
     from routing_client import RoutingClient, RoutingError  # type: ignore
+except Exception:
+    from route_planner_ai.routing_client import RoutingClient, RoutingError  # type: ignore
 
 try:
-    from route_planner_ai.conditions_client import ConditionsClient, ConditionsError  # type: ignore
-except Exception:
     from conditions_client import ConditionsClient, ConditionsError  # type: ignore
+except Exception:
+    from route_planner_ai.conditions_client import ConditionsClient, ConditionsError  # type: ignore
 
 try:
-    from route_planner_ai.traffic_client import TrafficClient  # type: ignore
-except Exception:
     from traffic_client import TrafficClient  # type: ignore
-
-try:
-    from route_planner_ai.risk_scoring import compute_route_risk  # type: ignore
 except Exception:
-    from risk_scoring import compute_route_risk  # type: ignore
-
+    from route_planner_ai.traffic_client import TrafficClient  # type: ignore
 
 try:
-    from route_planner_ai.conditions_client import CONDITIONS_CLIENT_VERSION  # type: ignore
+    from risk_scoring import compute_route_risk  # type: ignore
+except Exception:
+    from route_planner_ai.risk_scoring import compute_route_risk  # type: ignore
+
+try:
+    from conditions_client import CONDITIONS_CLIENT_VERSION  # type: ignore
 except Exception:
     try:
-        from conditions_client import CONDITIONS_CLIENT_VERSION  # type: ignore
+        from route_planner_ai.conditions_client import CONDITIONS_CLIENT_VERSION  # type: ignore
     except Exception:
         CONDITIONS_CLIENT_VERSION = None  # type: ignore
 
@@ -127,6 +111,7 @@ class PlanWorker(QRunnable):
         try:
             self.signals.started.emit("Contacting routing service...")
 
+            # Routing client
             try:
                 client = RoutingClient()
             except Exception as e:
@@ -135,6 +120,7 @@ class PlanWorker(QRunnable):
 
             conditions_client = ConditionsClient()
 
+            # Traffic client is optional
             try:
                 traffic_client = TrafficClient()
                 traffic_client_error = ""
@@ -142,7 +128,7 @@ class PlanWorker(QRunnable):
                 traffic_client = None
                 traffic_client_error = str(e)
 
-            # Routing
+            # ---------------- Routing ----------------
             self.signals.started.emit("Planning route(s)...")
             try:
                 if stops and hasattr(client, "get_route_with_stops"):
@@ -163,7 +149,7 @@ class PlanWorker(QRunnable):
                 self.signals.failed.emit("No routes found.")
                 return
 
-            # Weather
+            # ---------------- Weather ----------------
             self.signals.started.emit("Fetching weather snapshot...")
             weather_summary = ""
             try:
@@ -182,7 +168,7 @@ class PlanWorker(QRunnable):
                 stamp = f" [{CONDITIONS_CLIENT_VERSION}]" if CONDITIONS_CLIENT_VERSION else ""
                 weather_summary = f"Weather lookup not available{stamp}:\n{type(e).__name__}: {e}"
 
-            # Traffic + risk per route
+            # ---------------- Traffic + Risk per route ----------------
             self.signals.started.emit("Evaluating traffic + route risk...")
             per_route: List[Dict[str, Any]] = []
 
@@ -192,6 +178,7 @@ class PlanWorker(QRunnable):
                 minutes = float(summary.get("duration_minutes", 0.0) or 0.0)
                 geometry = route.get("geometry", None)
 
+                # Traffic
                 traffic_stats = None
                 if traffic_client is not None:
                     try:
@@ -202,11 +189,16 @@ class PlanWorker(QRunnable):
                     except Exception as e:
                         traffic_summary = f"Traffic incidents near route:\n- Error during traffic lookup: {e}"
                 else:
-                    traffic_summary = f"Traffic incidents near route:\n- Traffic client unavailable: {traffic_client_error}"
+                    traffic_summary = (
+                        "Traffic incidents near route:\n"
+                        f"- Traffic client unavailable: {traffic_client_error}"
+                    )
 
+                # Risk
                 risk_actions: List[str] = []
                 try:
                     try:
+                        # 4-return signature: score, label, explanation, actions
                         score, label, explanation, risk_actions = compute_route_risk(
                             miles,
                             minutes,
@@ -223,6 +215,7 @@ class PlanWorker(QRunnable):
                                 traffic_summary,
                             )
                         except ValueError:
+                            # 3-return legacy signature
                             score, label, explanation = compute_route_risk(
                                 miles,
                                 minutes,
@@ -267,6 +260,8 @@ class PlanWorker(QRunnable):
 # -----------------------------------------------------------------------------
 
 class StopRow(QWidget):
+    """Single stop input row with a remove button."""
+
     def __init__(self, remove_callback, parent=None):
         super().__init__(parent)
         self._remove_callback = remove_callback
@@ -299,8 +294,11 @@ class MainWindow(QMainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        self.setWindowTitle("Route Planner AI (Dispatch)")
+        self.setWindowTitle(f"Route Planner AI v{APP_VERSION} (Truck Dispatch)")
         self.resize(1400, 850)
+
+        self._mode: str = "dispatcher"
+        self._avg_speed_mph: int = 60
 
         self._stop_rows: List[StopRow] = []
         self._current_routes: List[Dict[str, Any]] = []
@@ -309,17 +307,42 @@ class MainWindow(QMainWindow):
         self._threadpool = QThreadPool.globalInstance()
         self._plan_button_enabled = True
 
-        # MAP refresh controls
+        # Map refresh controls
         self._map_ready: bool = False
         self._pending_map_payload: Optional[Tuple[Any, List[Dict[str, Any]], int]] = None
         self._map_nonce: int = 0
 
+        # ---------------- Left Panel ----------------
         left = QWidget()
         left_layout = QVBoxLayout()
         left.setLayout(left_layout)
 
-        form = QFormLayout()
+        # Mode selector (Dispatcher / Driver)
+        mode_row = QHBoxLayout()
+        mode_label = QLabel("Mode:")
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Dispatcher")
+        self.mode_combo.addItem("Driver")
+        self.mode_combo.setCurrentIndex(0)
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        mode_row.addWidget(mode_label)
+        mode_row.addWidget(self.mode_combo)
+        mode_row.addStretch(1)
+        left_layout.addLayout(mode_row)
 
+        # Average speed
+        speed_row = QHBoxLayout()
+        speed_label = QLabel("Average Speed (mph):")
+        self.speed_input = QSpinBox()
+        self.speed_input.setRange(20, 85)
+        self.speed_input.setValue(self._avg_speed_mph)
+        self.speed_input.valueChanged.connect(self._on_speed_changed)
+        speed_row.addWidget(speed_label)
+        speed_row.addWidget(self.speed_input)
+        speed_row.addStretch(1)
+        left_layout.addLayout(speed_row)
+
+        form = QFormLayout()
         self.origin_input = QLineEdit()
         self.origin_input.setPlaceholderText("Origin (City, ST / address / ZIP)")
         form.addRow(QLabel("Origin:"), self.origin_input)
@@ -327,9 +350,9 @@ class MainWindow(QMainWindow):
         self.destination_input = QLineEdit()
         self.destination_input.setPlaceholderText("Destination (City, ST / address / ZIP)")
         form.addRow(QLabel("Destination:"), self.destination_input)
-
         left_layout.addLayout(form)
 
+        # Stops header + add button
         stops_header = QHBoxLayout()
         stops_header.addWidget(QLabel("Stops (optional, multi-drop):"))
         self.add_stop_btn = QPushButton("+ Add Stop")
@@ -338,12 +361,14 @@ class MainWindow(QMainWindow):
         stops_header.addStretch(1)
         left_layout.addLayout(stops_header)
 
+        # Stops container
         self.stops_container = QWidget()
         self.stops_layout = QVBoxLayout()
         self.stops_layout.setContentsMargins(0, 0, 0, 0)
         self.stops_container.setLayout(self.stops_layout)
         left_layout.addWidget(self.stops_container)
 
+        # Action buttons
         actions = QHBoxLayout()
         self.plan_btn = QPushButton("Plan Route")
         self.plan_btn.clicked.connect(self.on_plan_route_clicked)
@@ -359,25 +384,30 @@ class MainWindow(QMainWindow):
 
         left_layout.addLayout(actions)
 
+        # Routes list
         left_layout.addWidget(QLabel("Routes:"))
         self.route_list = QListWidget()
         self.route_list.currentRowChanged.connect(self._on_route_selected)
         self.route_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         left_layout.addWidget(self.route_list, stretch=1)
 
+        # ---------------- Right Panel ----------------
         right = QWidget()
         right_layout = QVBoxLayout()
         right.setLayout(right_layout)
 
+        # Map view
         self.map_view = QWebEngineView()
         self.map_view.setMinimumHeight(420)
         right_layout.addWidget(self.map_view)
 
+        # Conditions / report
         self.conditions_text = QTextEdit()
         self.conditions_text.setReadOnly(True)
         self.conditions_text.setPlaceholderText("Dispatch report will appear here...")
         right_layout.addWidget(self.conditions_text, stretch=1)
 
+        # Splitter
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(left)
         splitter.addWidget(right)
@@ -390,6 +420,7 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(splitter)
         self.setCentralWidget(container)
 
+        # Initialize map
         self._load_map()
 
     # -------------------------
@@ -504,7 +535,9 @@ class MainWindow(QMainWindow):
 
         js_coords = json.dumps(coords)
         js_markers = json.dumps(markers)
-        self.map_view.page().runJavaScript(f"window.setRouteAndMarkers({js_coords}, {js_markers}, {int(nonce)});")
+        self.map_view.page().runJavaScript(
+            f"window.setRouteAndMarkers({js_coords}, {js_markers}, {int(nonce)});"
+        )
 
     # -------------------------
     # Stops UI
@@ -525,9 +558,23 @@ class MainWindow(QMainWindow):
         return [r.value() for r in self._stop_rows if r.value()]
 
     def _clear_all_stops(self) -> None:
-        # remove in reverse to avoid layout churn issues
         for row in list(self._stop_rows)[::-1]:
             self._remove_stop_row(row)
+
+    # -------------------------
+    # Mode / speed
+    # -------------------------
+
+    def _on_mode_changed(self, index: int) -> None:
+        text = self.mode_combo.currentText().strip().lower()
+        if text.startswith("driver"):
+            self._mode = "driver"
+        else:
+            self._mode = "dispatcher"
+        # Currently, mode lightly affects reporting only.
+
+    def _on_speed_changed(self, value: int) -> None:
+        self._avg_speed_mph = int(value)
 
     # -------------------------
     # Actions
@@ -545,7 +592,7 @@ class MainWindow(QMainWindow):
         if not self._plan_button_enabled:
             return
 
-        self._plan_button_enabled = False
+        self._plan_button_enabled = True
         self.plan_btn.setEnabled(False)
 
         self.route_list.clear()
@@ -553,7 +600,7 @@ class MainWindow(QMainWindow):
         self._last_plan = None
         self.conditions_text.setPlainText("Starting...")
 
-        # Force-clear map on new run
+        # Clear map on new run
         self._push_map({"type": "LineString", "coordinates": []}, [])
 
         worker = PlanWorker(PlanInput(origin=origin, destination=destination, stops=stops))
@@ -563,27 +610,20 @@ class MainWindow(QMainWindow):
         self._threadpool.start(worker)
 
     def _on_clear_clicked(self) -> None:
-        """
-        Clear last route and reset UI so another route can be entered immediately.
-        """
-        # allow re-plan instantly
+        """Clear last route and reset UI."""
         self._plan_button_enabled = True
         self.plan_btn.setEnabled(True)
 
-        # clear state
         self._current_routes = []
         self._last_plan = None
 
-        # clear UI inputs
         self.origin_input.clear()
         self.destination_input.clear()
         self._clear_all_stops()
 
-        # clear outputs
         self.route_list.clear()
         self.conditions_text.setPlainText("Cleared. Enter a new route and click 'Plan Route'.")
 
-        # clear map
         self._push_map({"type": "LineString", "coordinates": []}, [])
 
     def _on_worker_status(self, msg: str) -> None:
@@ -668,6 +708,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+        # Fallback markers from geometry if geocode fails everywhere
         if not markers and isinstance(geometry, dict) and isinstance(geometry.get("coordinates"), list):
             coords = geometry["coordinates"]
             if len(coords) >= 2:
@@ -712,7 +753,8 @@ class MainWindow(QMainWindow):
         else:
             sanity_line = f"Sanity safeguard: ACTIVE ({threshold}× straight-line anomaly block)"
 
-        dispatch_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.now()
+        dispatch_timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
         route_id = str(uuid.uuid4())[:8]
         trip_type = "Multi-drop" if stops else "Direct"
 
@@ -743,7 +785,8 @@ class MainWindow(QMainWindow):
             actions = pr.get("risk_actions", []) or []
 
             route_lines.append(
-                f"- Route {idx + 1}: {miles:.1f} miles, {hours}h {mins}m — Risk {label} ({score}/100); {expl}"
+                f"- Route {idx + 1}: {miles:.1f} miles, {hours}h {mins}m — "
+                f"Risk {label} ({score}/100); {expl}"
             )
 
             if idx == 0:
@@ -754,15 +797,19 @@ class MainWindow(QMainWindow):
                     f"- Factors: {expl}\n"
                 )
                 if actions:
-                    actions_block = "Recommended actions (dispatcher guidance):\n" + "\n".join(
-                        [f"- {a}" for a in actions]
-                    ) + "\n"
+                    actions_block = (
+                        "Recommended actions (dispatcher guidance):\n"
+                        + "\n".join([f"- {a}" for a in actions])
+                        + "\n"
+                    )
 
             candidate = (score, miles, idx, label, expl)
             if best_choice is None:
                 best_choice = candidate
             else:
-                if candidate[0] < best_choice[0] or (candidate[0] == best_choice[0] and candidate[1] < best_choice[1]):
+                if candidate[0] < best_choice[0] or (
+                    candidate[0] == best_choice[0] and candidate[1] < best_choice[1]
+                ):
                     best_choice = candidate
 
         recommended_block = ""
@@ -771,6 +818,22 @@ class MainWindow(QMainWindow):
             recommended_block = (
                 "\nRecommended route (based on lowest risk, then shortest distance):\n"
                 f"- Route {idx + 1}: {miles:.1f} miles — Risk {label} ({score}/100); {expl}\n"
+            )
+
+        # Driver-only ETA block using average speed
+        driver_block = ""
+        if self._mode == "driver" and miles_primary > 0 and self._avg_speed_mph > 0:
+            travel_hours = miles_primary / float(self._avg_speed_mph)
+            eta_dt = now + timedelta(hours=travel_hours)
+            eta_str = eta_dt.strftime("%Y-%m-%d %H:%M")
+            eta_h = int(travel_hours)
+            eta_m = int(round((travel_hours - eta_h) * 60))
+
+            driver_block = (
+                "\nDriver view (based on average speed):\n"
+                f"- Average speed: {self._avg_speed_mph} mph\n"
+                f"- Approx driving time at this speed: {eta_h}h {eta_m}m\n"
+                f"- Estimated arrival time (assuming departure at dispatch timestamp): {eta_str}\n"
             )
 
         conditions_ver = CONDITIONS_CLIENT_VERSION or "unknown"
@@ -783,6 +846,7 @@ class MainWindow(QMainWindow):
             "- Geocoding: ORS Pelias\n"
             f"- Weather: Open-Meteo (ConditionsClient {conditions_ver})\n"
             "- Traffic: TomTom Incident Details API (cached)\n"
+            f"- UI mode: {self._mode.upper()} | Avg speed: {self._avg_speed_mph} mph\n"
         )
 
         header = (
@@ -802,16 +866,23 @@ class MainWindow(QMainWindow):
             + f"- Distance: {miles_primary:.1f} miles\n"
             + f"- Estimated drive time: {hours_primary}h {mins_primary}m\n"
             + f"- Geometry: {geometry_info}\n\n"
-            + toll_block + "\n"
+            + toll_block
+            + "\n"
             + f"{weather_summary}\n\n"
             + f"{traffic_summary_primary}\n\n"
             + f"{risk_text_primary}\n"
             + (actions_block + "\n" if actions_block else "")
-            + recommended_block + "\n"
+            + driver_block
+            + recommended_block
+            + "\n"
             + f"Route comparison summary for: {origin} → {destination}\n"
             + "\n".join(route_lines)
             + policy_footer
         )
+
+    # -------------------------
+    # Clipboard
+    # -------------------------
 
     def _on_copy_clicked(self) -> None:
         QApplication.clipboard().setText(self.conditions_text.toPlainText())
