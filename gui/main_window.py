@@ -142,7 +142,7 @@ class PlanWorker(QRunnable):
                     stop_based = True
                 else:
                     stop_based = False
-                    # Phase 2: In Driver mode, attempt to request provider alternatives if supported.
+                    # In Driver mode, attempt to request provider alternatives if supported.
                     if mode == "driver":
                         try:
                             plan = client.get_routes(origin, destination, alternatives=True)  # type: ignore
@@ -678,7 +678,9 @@ class MainWindow(QMainWindow):
         # Clear map on new run
         self._push_map({"type": "LineString", "coordinates": []}, [])
 
-        worker = PlanWorker(PlanInput(origin=origin, destination=destination, stops=stops, mode=self._mode))
+        worker = PlanWorker(
+            PlanInput(origin=origin, destination=destination, stops=stops, mode=self._mode)
+        )
         worker.signals.started.connect(self._on_worker_status)
         worker.signals.failed.connect(self._on_worker_failed)
         worker.signals.finished.connect(self._on_worker_finished)
@@ -835,7 +837,10 @@ class MainWindow(QMainWindow):
             ratio = sanity.get("ratio")
             threshold = float(sanity.get("threshold", 3.0) or 3.0)
             straight = sanity.get("straight_line_miles", "N/A")
-            sanity_line = f"Sanity check: PASS ({ratio}×, threshold {threshold}×) | Straight-line: {straight} miles"
+            sanity_line = (
+                f"Sanity check: PASS ({ratio}×, threshold {threshold}×) | "
+                f"Straight-line: {straight} miles"
+            )
         else:
             sanity_line = f"Sanity safeguard: ACTIVE ({threshold}× straight-line anomaly block)"
 
@@ -855,9 +860,18 @@ class MainWindow(QMainWindow):
         risk_text_primary = ""
         actions_block = ""
         route_lines: List[str] = []
-        best_choice: Optional[Tuple[int, float, int, str, str]] = None
+
+        # For delta comparisons
+        primary_risk_score: Optional[int] = None
+        primary_cost_estimate: Optional[float] = None
+        miles_list: List[float] = []
+        minutes_list: List[float] = []
+        score_list: List[int] = []
+        fuel_cost_list: List[Optional[float]] = []
 
         # Per-route summary (distance, risk, fuel if Driver)
+        best_choice: Optional[Tuple[int, float, int, str, str]] = None
+
         for idx, route in enumerate(routes):
             summary = route.get("summary", {}) or {}
             miles = float(summary.get("distance_miles", 0.0) or 0.0)
@@ -872,6 +886,18 @@ class MainWindow(QMainWindow):
             expl = str(pr.get("risk_explanation", ""))
             actions = pr.get("risk_actions", []) or []
 
+            # Store for deltas
+            miles_list.append(miles)
+            minutes_list.append(minutes)
+            score_list.append(score)
+
+            gallons = None
+            cost = None
+            if self._mode == "driver" and self._mpg > 0 and self._fuel_price > 0 and miles > 0:
+                gallons = miles / float(self._mpg)
+                cost = gallons * self._fuel_price
+            fuel_cost_list.append(cost)
+
             # Route naming respects Driver / Dispatcher mode
             if self._mode == "driver":
                 if idx == 0:
@@ -885,9 +911,7 @@ class MainWindow(QMainWindow):
 
             # Fuel estimate per route (Driver mode only)
             fuel_info_str = ""
-            if self._mode == "driver" and self._mpg > 0 and self._fuel_price > 0 and miles > 0:
-                gallons = miles / float(self._mpg)
-                cost = gallons * self._fuel_price
+            if gallons is not None and cost is not None:
                 fuel_info_str = f"; est fuel {gallons:.1f} gal, ~${cost:.2f}"
 
             route_lines.append(
@@ -909,6 +933,9 @@ class MainWindow(QMainWindow):
                         + "\n".join([f"- {a}" for a in actions])
                         + "\n"
                     )
+                primary_risk_score = score
+                if cost is not None:
+                    primary_cost_estimate = cost
 
             candidate = (score, miles, idx, label, expl)
             if best_choice is None:
@@ -934,7 +961,12 @@ class MainWindow(QMainWindow):
             else:
                 best_name = f"Route {idx + 1}"
 
-            if self._mode == "driver" and self._mpg > 0 and self._fuel_price > 0 and miles > 0:
+            if (
+                self._mode == "driver"
+                and self._mpg > 0
+                and self._fuel_price > 0
+                and miles > 0
+            ):
                 gallons_best = miles / float(self._mpg)
                 cost_best = gallons_best * self._fuel_price
                 fuel_best_suffix = f"; est fuel {gallons_best:.1f} gal, ~${cost_best:.2f}"
@@ -944,10 +976,11 @@ class MainWindow(QMainWindow):
                 f"- {best_name}: {miles:.1f} miles — Risk {label} ({score}/100); {expl}{fuel_best_suffix}\n"
             )
 
-        # Driver-only ETA and fuel blocks
+        # Driver-only ETA, fuel, and delta blocks
         driver_block = ""
         eta_weather_block = ""
         fuel_block = ""
+        delta_block = ""
 
         if self._mode == "driver" and miles_primary > 0 and self._avg_speed_mph > 0:
             travel_hours = miles_primary / float(self._avg_speed_mph)
@@ -993,6 +1026,9 @@ class MainWindow(QMainWindow):
                     f"- Estimated fuel used (primary): {gallons_primary:.1f} gal\n"
                     f"- Estimated fuel cost (primary): ${cost_primary:.2f}\n"
                 )
+                # If primary_cost_estimate was not set earlier, ensure it is available for deltas
+                if primary_cost_estimate is None:
+                    primary_cost_estimate = cost_primary
 
             # Time-aligned weather forecast for Driver mode, if supported by ConditionsClient
             try:
@@ -1049,6 +1085,51 @@ class MainWindow(QMainWindow):
                     f"{type(e).__name__}: {e}\n"
                 )
 
+            # Route delta block (vs primary), Driver mode only
+            if len(routes) > 1 and miles_primary > 0 and score_list:
+                primary_score_val = (
+                    primary_risk_score if primary_risk_score is not None else score_list[0]
+                )
+                delta_lines: List[str] = []
+                for idx in range(1, len(routes)):
+                    miles = miles_list[idx]
+                    minutes = minutes_list[idx]
+                    score = score_list[idx]
+
+                    dmiles = miles - miles_primary
+                    dmins = minutes - minutes_primary
+                    dscore = score - primary_score_val
+
+                    dmiles_str = f"{'+' if dmiles >= 0 else ''}{dmiles:.1f} mi"
+                    dmins_str = f"{'+' if dmins >= 0 else ''}{int(round(dmins))} min"
+                    dscore_str = f"{'+' if dscore >= 0 else ''}{dscore} risk"
+
+                    cost_delta_str = ""
+                    if (
+                        primary_cost_estimate is not None
+                        and idx < len(fuel_cost_list)
+                        and fuel_cost_list[idx] is not None
+                    ):
+                        dcost = fuel_cost_list[idx] - primary_cost_estimate
+                        cost_delta_str = f", {'+' if dcost >= 0 else ''}${dcost:.2f} fuel"
+
+                    # Route name for delta description
+                    if idx == 1:
+                        route_label = "Route 2 (Alternate)"
+                    else:
+                        route_label = f"Route {idx + 1}"
+
+                    delta_lines.append(
+                        f"- {route_label}: {dmiles_str}, {dmins_str}, {dscore_str}{cost_delta_str}"
+                    )
+
+                if delta_lines:
+                    delta_block = (
+                        "\nRoute deltas vs Route 1 (Primary):\n"
+                        + "\n".join(delta_lines)
+                        + "\n"
+                    )
+
         conditions_ver = CONDITIONS_CLIENT_VERSION or "unknown"
         policy_footer = (
             "\n\nPolicy & System Context:\n"
@@ -1090,6 +1171,7 @@ class MainWindow(QMainWindow):
             + fuel_block
             + eta_weather_block
             + recommended_block
+            + delta_block
             + "\n"
             + f"Route comparison summary for: {origin} \u2192 {destination}\n"
             + "\n".join(route_lines)
