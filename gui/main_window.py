@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QComboBox,
     QSpinBox,
+    QDoubleSpinBox,
     QTimeEdit,
     QDateEdit,
 )
@@ -136,7 +137,7 @@ class PlanWorker(QRunnable):
             self.signals.started.emit("Planning route(s)...")
             try:
                 if stops and hasattr(client, "get_route_with_stops"):
-                    # Multi-drop behavior stays unchanged for now (no alternatives toggle).
+                    # Multi-drop behavior stays unchanged (no alternatives toggle here).
                     plan = client.get_route_with_stops(origin, stops, destination)  # type: ignore
                     stop_based = True
                 else:
@@ -144,10 +145,8 @@ class PlanWorker(QRunnable):
                     # Phase 2: In Driver mode, attempt to request provider alternatives if supported.
                     if mode == "driver":
                         try:
-                            # Prefer a keyword argument pattern; fall back cleanly if unsupported.
                             plan = client.get_routes(origin, destination, alternatives=True)  # type: ignore
                         except TypeError:
-                            # Older signatures without 'alternatives' kwarg.
                             plan = client.get_routes(origin, destination)
                     else:
                         plan = client.get_routes(origin, destination)
@@ -163,7 +162,7 @@ class PlanWorker(QRunnable):
                 self.signals.failed.emit("No routes found.")
                 return
 
-            # ---------------- Weather ----------------
+            # ---------------- Weather (snapshot) ----------------
             self.signals.started.emit("Fetching weather snapshot...")
             weather_summary = ""
             try:
@@ -275,7 +274,6 @@ class PlanWorker(QRunnable):
 
 class StopRow(QWidget):
     """Single stop input row with a remove button."""
-
     def __init__(self, remove_callback, parent=None):
         super().__init__(parent)
         self._remove_callback = remove_callback
@@ -311,8 +309,11 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"Route Planner AI v{APP_VERSION} (Truck Dispatch)")
         self.resize(1400, 850)
 
+        # Mode + driver parameters
         self._mode: str = "dispatcher"
         self._avg_speed_mph: int = 60
+        self._mpg: int = 7
+        self._fuel_price: float = 4.00
 
         self._stop_rows: List[StopRow] = []
         self._current_routes: List[Dict[str, Any]] = []
@@ -356,6 +357,32 @@ class MainWindow(QMainWindow):
         speed_row.addStretch(1)
         left_layout.addLayout(speed_row)
 
+        # Truck MPG (Driver fuel model)
+        mpg_row = QHBoxLayout()
+        mpg_label = QLabel("Truck MPG:")
+        self.mpg_input = QSpinBox()
+        self.mpg_input.setRange(3, 15)
+        self.mpg_input.setValue(self._mpg)
+        self.mpg_input.valueChanged.connect(self._on_mpg_changed)
+        mpg_row.addWidget(mpg_label)
+        mpg_row.addWidget(self.mpg_input)
+        mpg_row.addStretch(1)
+        left_layout.addLayout(mpg_row)
+
+        # Fuel price (Driver fuel model)
+        fuel_row = QHBoxLayout()
+        fuel_label = QLabel("Fuel price (USD/gal):")
+        self.fuel_price_input = QDoubleSpinBox()
+        self.fuel_price_input.setRange(2.0, 10.0)
+        self.fuel_price_input.setSingleStep(0.10)
+        self.fuel_price_input.setDecimals(2)
+        self.fuel_price_input.setValue(self._fuel_price)
+        self.fuel_price_input.valueChanged.connect(self._on_fuel_price_changed)
+        fuel_row.addWidget(fuel_label)
+        fuel_row.addWidget(self.fuel_price_input)
+        fuel_row.addStretch(1)
+        left_layout.addLayout(fuel_row)
+
         # Departure date/time (Driver mode only)
         depart_row = QHBoxLayout()
         depart_label = QLabel("Departure (date/time):")
@@ -373,6 +400,7 @@ class MainWindow(QMainWindow):
         depart_row.addStretch(1)
         left_layout.addLayout(depart_row)
 
+        # Origin / destination
         form = QFormLayout()
         self.origin_input = QLineEdit()
         self.origin_input.setPlaceholderText("Origin (City, ST / address / ZIP)")
@@ -454,7 +482,7 @@ class MainWindow(QMainWindow):
         # Initialize map
         self._load_map()
 
-        # Initialize departure controls state based on mode
+        # Initialize driver-specific control states
         self._update_depart_controls_enabled()
 
     # -------------------------
@@ -520,7 +548,7 @@ class MainWindow(QMainWindow):
   }
 
   window.setRouteAndMarkers = function(coords, markers, nonce) {
-    const _ = nonce; // nonce forces redraw
+    const _ = nonce;
     clearAll();
 
     if (coords && coords.length >= 2) {
@@ -596,13 +624,15 @@ class MainWindow(QMainWindow):
             self._remove_stop_row(row)
 
     # -------------------------
-    # Mode / speed
+    # Mode / speed / fuel controls
     # -------------------------
 
     def _update_depart_controls_enabled(self) -> None:
         enabled = self._mode == "driver"
         self.depart_date_edit.setEnabled(enabled)
         self.depart_time_edit.setEnabled(enabled)
+        self.mpg_input.setEnabled(enabled)
+        self.fuel_price_input.setEnabled(enabled)
 
     def _on_mode_changed(self, index: int) -> None:
         text = self.mode_combo.currentText().strip().lower()
@@ -614,6 +644,12 @@ class MainWindow(QMainWindow):
 
     def _on_speed_changed(self, value: int) -> None:
         self._avg_speed_mph = int(value)
+
+    def _on_mpg_changed(self, value: int) -> None:
+        self._mpg = int(value)
+
+    def _on_fuel_price_changed(self, value: float) -> None:
+        self._fuel_price = float(value)
 
     # -------------------------
     # Actions
@@ -808,6 +844,7 @@ class MainWindow(QMainWindow):
         route_id = str(uuid.uuid4())[:8]
         trip_type = "Multi-drop" if stops else "Direct"
 
+        # Tolls block
         toll_block = "Tolls:\n"
         if isinstance(toll_info, dict) and toll_info.get("available"):
             toll_block += f"- {toll_info.get('detail') or 'Toll info available.'}\n"
@@ -820,6 +857,7 @@ class MainWindow(QMainWindow):
         route_lines: List[str] = []
         best_choice: Optional[Tuple[int, float, int, str, str]] = None
 
+        # Per-route summary (distance, risk, fuel if Driver)
         for idx, route in enumerate(routes):
             summary = route.get("summary", {}) or {}
             miles = float(summary.get("distance_miles", 0.0) or 0.0)
@@ -834,6 +872,7 @@ class MainWindow(QMainWindow):
             expl = str(pr.get("risk_explanation", ""))
             actions = pr.get("risk_actions", []) or []
 
+            # Route naming respects Driver / Dispatcher mode
             if self._mode == "driver":
                 if idx == 0:
                     route_name = "Route 1 (Primary)"
@@ -844,11 +883,19 @@ class MainWindow(QMainWindow):
             else:
                 route_name = f"Route {idx + 1}"
 
+            # Fuel estimate per route (Driver mode only)
+            fuel_info_str = ""
+            if self._mode == "driver" and self._mpg > 0 and self._fuel_price > 0 and miles > 0:
+                gallons = miles / float(self._mpg)
+                cost = gallons * self._fuel_price
+                fuel_info_str = f"; est fuel {gallons:.1f} gal, ~${cost:.2f}"
+
             route_lines.append(
                 f"- {route_name}: {miles:.1f} miles, {hours}h {mins}m — "
-                f"Risk {label} ({score}/100); {expl}"
+                f"Risk {label} ({score}/100); {expl}{fuel_info_str}"
             )
 
+            # Primary route details
             if idx == 0:
                 traffic_summary_primary = traffic_summary
                 risk_text_primary = (
@@ -872,7 +919,9 @@ class MainWindow(QMainWindow):
                 ):
                     best_choice = candidate
 
+        # Recommended route block
         recommended_block = ""
+        fuel_best_suffix = ""
         if best_choice:
             score, miles, idx, label, expl = best_choice
             if self._mode == "driver":
@@ -885,14 +934,20 @@ class MainWindow(QMainWindow):
             else:
                 best_name = f"Route {idx + 1}"
 
+            if self._mode == "driver" and self._mpg > 0 and self._fuel_price > 0 and miles > 0:
+                gallons_best = miles / float(self._mpg)
+                cost_best = gallons_best * self._fuel_price
+                fuel_best_suffix = f"; est fuel {gallons_best:.1f} gal, ~${cost_best:.2f}"
+
             recommended_block = (
                 "\nRecommended route (based on lowest risk, then shortest distance):\n"
-                f"- {best_name}: {miles:.1f} miles — Risk {label} ({score}/100); {expl}\n"
+                f"- {best_name}: {miles:.1f} miles — Risk {label} ({score}/100); {expl}{fuel_best_suffix}\n"
             )
 
-        # Driver-only ETA block using average speed and departure date/time
+        # Driver-only ETA and fuel blocks
         driver_block = ""
         eta_weather_block = ""
+        fuel_block = ""
 
         if self._mode == "driver" and miles_primary > 0 and self._avg_speed_mph > 0:
             travel_hours = miles_primary / float(self._avg_speed_mph)
@@ -927,9 +982,20 @@ class MainWindow(QMainWindow):
                 f"- Estimated arrival time: {eta_str}\n"
             )
 
+            # Fuel estimate for primary route (Driver mode)
+            if self._mpg > 0 and self._fuel_price > 0:
+                gallons_primary = miles_primary / float(self._mpg)
+                cost_primary = gallons_primary * self._fuel_price
+                fuel_block = (
+                    "\nFuel estimate (driver planning):\n"
+                    f"- Truck MPG: {self._mpg} mpg\n"
+                    f"- Fuel price (est): ${self._fuel_price:.2f}/gal\n"
+                    f"- Estimated fuel used (primary): {gallons_primary:.1f} gal\n"
+                    f"- Estimated fuel cost (primary): ${cost_primary:.2f}\n"
+                )
+
             # Time-aligned weather forecast for Driver mode, if supported by ConditionsClient
             try:
-                # Derive origin/destination coordinates from primary route geometry
                 origin_lat = origin_lon = dest_lat = dest_lon = None
                 if isinstance(geom, dict) and isinstance(geom.get("coordinates"), list):
                     coords = geom.get("coordinates") or []
@@ -993,6 +1059,7 @@ class MainWindow(QMainWindow):
             "- Geocoding: ORS Pelias\n"
             f"- Weather: Open-Meteo (ConditionsClient {conditions_ver})\n"
             "- Traffic: TomTom Incident Details API (cached)\n"
+            "- Fuel modeling: driver-only; costs estimated from distance, MPG, and user fuel price\n"
             f"- UI mode: {self._mode.upper()} | Avg speed: {self._avg_speed_mph} mph\n"
         )
 
@@ -1020,6 +1087,7 @@ class MainWindow(QMainWindow):
             + f"{risk_text_primary}\n"
             + (actions_block + "\n" if actions_block else "")
             + driver_block
+            + fuel_block
             + eta_weather_block
             + recommended_block
             + "\n"
