@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, time as dt_time
+from datetime import datetime, timedelta
 from math import floor
 from pathlib import Path
 import json
@@ -137,7 +137,7 @@ class PlanWorker(QRunnable):
             self.signals.started.emit("Planning route(s)...")
             try:
                 if stops and hasattr(client, "get_route_with_stops"):
-                    # Multi-drop behavior stays unchanged (no alternatives toggle here).
+                    # Multi-drop behavior stays unchanged.
                     plan = client.get_route_with_stops(origin, stops, destination)  # type: ignore
                     stop_based = True
                 else:
@@ -311,7 +311,7 @@ class MainWindow(QMainWindow):
 
         # Mode + driver parameters
         self._mode: str = "dispatcher"
-        self._avg_speed_mph: int = 60
+        self._avg_speed_mph: int = 70  # default driver speed preference
         self._mpg: int = 7
         self._fuel_price: float = 4.00
 
@@ -326,6 +326,13 @@ class MainWindow(QMainWindow):
         self._map_ready: bool = False
         self._pending_map_payload: Optional[Tuple[Any, List[Dict[str, Any]], int]] = None
         self._map_nonce: int = 0
+
+        # Driver ETA-weather marker info for map
+        # {
+        #   "midpoint": {"time": datetime, "desc": str},
+        #   "destination": {"time": datetime, "desc": str}
+        # }
+        self._eta_marker_info: Optional[Dict[str, Any]] = None
 
         # ---------------- Left Panel ----------------
         left = QWidget()
@@ -511,6 +518,12 @@ class MainWindow(QMainWindow):
       font-size: 12px;
       font-weight: 800;
     }
+    .weather-icon {
+      background: transparent;
+      border: none;
+      font-size: 20px;
+      text-align: center;
+    }
   </style>
 </head>
 <body>
@@ -534,17 +547,43 @@ class MainWindow(QMainWindow):
     markerLayer.clearLayers();
   }
 
-  function addLabeledMarker(lat, lon, label, popupText) {
-    const m = L.marker([lat, lon]).addTo(markerLayer);
-    if (popupText) m.bindPopup(popupText);
+  function addMarker(m) {
+    const lat = m.lat;
+    const lon = m.lon;
+    const label = m.label || "";
+    const popupText = m.popup || "";
+    const iconType = m.icon_type || "stop";
+    const iconHtml = m.icon_html || "";
 
-    const icon = L.divIcon({
-      className: 'stop-label',
-      html: label,
-      iconSize: [24, 24],
-      iconAnchor: [12, 12]
-    });
-    L.marker([lat, lon], { icon }).addTo(markerLayer);
+    if (iconType === "weather" && iconHtml) {
+      const icon = L.divIcon({
+        className: 'weather-icon',
+        html: iconHtml,
+        iconSize: [24, 24],
+        iconAnchor: [12, 12]
+      });
+      const marker = L.marker([lat, lon], { icon }).addTo(markerLayer);
+      if (popupText) {
+        marker.bindPopup(popupText);
+      }
+      return;
+    }
+
+    // Default: normal marker + label bubble
+    const mBase = L.marker([lat, lon]).addTo(markerLayer);
+    if (popupText) {
+      mBase.bindPopup(popupText);
+    }
+
+    if (label) {
+      const icon = L.divIcon({
+        className: 'stop-label',
+        html: label,
+        iconSize: [24, 24],
+        iconAnchor: [12, 12]
+      });
+      L.marker([lat, lon], { icon }).addTo(markerLayer);
+    }
   }
 
   window.setRouteAndMarkers = function(coords, markers, nonce) {
@@ -559,7 +598,7 @@ class MainWindow(QMainWindow):
 
     if (markers && markers.length) {
       for (const m of markers) {
-        addLabeledMarker(m.lat, m.lon, m.label, m.popup);
+        addMarker(m);
       }
     }
   }
@@ -673,6 +712,7 @@ class MainWindow(QMainWindow):
         self.route_list.clear()
         self._current_routes = []
         self._last_plan = None
+        self._eta_marker_info = None
         self.conditions_text.setPlainText("Starting...")
 
         # Clear map on new run
@@ -693,6 +733,7 @@ class MainWindow(QMainWindow):
 
         self._current_routes = []
         self._last_plan = None
+        self._eta_marker_info = None
 
         self.origin_input.clear()
         self.destination_input.clear()
@@ -735,14 +776,38 @@ class MainWindow(QMainWindow):
 
             self.route_list.addItem(f"{prefix} - {miles:.1f} miles, {hours}h {mins}m")
 
+        # Always compute the report first so ETA marker info is available
+        self.conditions_text.setPlainText(self._build_dispatch_report(result))
+
         if self._current_routes:
+            # Select primary and render it with markers (including ETA-weather markers if available)
             self.route_list.setCurrentRow(0)
             self._render_selected_route(0)
 
-        self.conditions_text.setPlainText(self._build_dispatch_report(result))
-
         self.plan_btn.setEnabled(True)
         self._plan_button_enabled = True
+
+    # -------------------------
+    # Weather icon helper
+    # -------------------------
+
+    @staticmethod
+    def _weather_icon_from_desc(desc: str) -> str:
+        """Return an emoji icon based on a short weather description."""
+        text = (desc or "").lower()
+        if "snow" in text or "flurries" in text or "sleet" in text or "blizzard" in text:
+            return "❄️"
+        if "thunder" in text or "storm" in text:
+            return "⛈️"
+        if "rain" in text or "showers" in text or "drizzle" in text:
+            return "🌧️"
+        if "overcast" in text or "cloudy" in text:
+            return "☁️"
+        if "clear" in text or "sunny" in text:
+            return "☀️"
+        if "wind" in text or "breeze" in text or "gust" in text:
+            return "💨"
+        return "🌡️"
 
     # -------------------------
     # Route selection + map rendering
@@ -764,8 +829,24 @@ class MainWindow(QMainWindow):
 
         markers: List[Dict[str, Any]] = []
 
-        def _add_marker(lat: float, lon: float, label: str, popup: str) -> None:
-            markers.append({"lat": float(lat), "lon": float(lon), "label": label, "popup": popup})
+        def _add_marker(
+            lat: float,
+            lon: float,
+            label: str,
+            popup: str,
+            icon_type: str = "stop",
+            icon_html: Optional[str] = None,
+        ) -> None:
+            markers.append(
+                {
+                    "lat": float(lat),
+                    "lon": float(lon),
+                    "label": label,
+                    "popup": popup,
+                    "icon_type": icon_type,
+                    "icon_html": icon_html or "",
+                }
+            )
 
         try:
             client = RoutingClient()
@@ -776,36 +857,100 @@ class MainWindow(QMainWindow):
         dest_txt = self._last_plan.destination
         stops_txt = self._last_plan.stops or []
 
+        # Base O / stops / D markers via geocoding (stop markers remain labeled)
         if client is not None and hasattr(client, "geocode"):
             try:
                 o_lat, o_lon = client.geocode(origin_txt)  # type: ignore
-                _add_marker(o_lat, o_lon, "O", f"Origin: {origin_txt}")
+                _add_marker(o_lat, o_lon, "O", f"Origin: {origin_txt}", icon_type="stop")
             except Exception:
                 pass
 
             for i, s in enumerate(stops_txt, start=1):
                 try:
                     s_lat, s_lon = client.geocode(s)  # type: ignore
-                    _add_marker(s_lat, s_lon, str(i), f"Stop {i}: {s}")
+                    _add_marker(s_lat, s_lon, str(i), f"Stop {i}: {s}", icon_type="stop")
                 except Exception:
                     continue
 
             try:
                 d_lat, d_lon = client.geocode(dest_txt)  # type: ignore
-                _add_marker(d_lat, d_lon, "D", f"Destination: {dest_txt}")
+                _add_marker(d_lat, d_lon, "D", f"Destination: {dest_txt}", icon_type="stop")
             except Exception:
                 pass
 
-        # Fallback markers from geometry if geocode fails everywhere
+        # Fallback O / D markers from geometry if geocode fails everywhere
         if not markers and isinstance(geometry, dict) and isinstance(geometry.get("coordinates"), list):
             coords = geometry["coordinates"]
             if len(coords) >= 2:
                 o = coords[0]
                 d = coords[-1]
                 if isinstance(o, (list, tuple)) and len(o) == 2:
-                    _add_marker(o[1], o[0], "O", f"Origin: {origin_txt}")
+                    _add_marker(o[1], o[0], "O", f"Origin: {origin_txt}", icon_type="stop")
                 if isinstance(d, (list, tuple)) and len(d) == 2:
-                    _add_marker(d[1], d[0], "D", f"Destination: {dest_txt}")
+                    _add_marker(d[1], d[0], "D", f"Destination: {dest_txt}", icon_type="stop")
+
+        # ETA weather markers (Driver mode only) as icons, no M/E letters
+        if (
+            self._mode == "driver"
+            and self._eta_marker_info is not None
+            and isinstance(geometry, dict)
+            and isinstance(geometry.get("coordinates"), list)
+        ):
+            coords = geometry.get("coordinates") or []
+            if len(coords) >= 2:
+                try:
+                    mid_idx = len(coords) // 2
+                    mid = coords[mid_idx]
+                    d = coords[-1]
+
+                    mid_info = self._eta_marker_info.get("midpoint") if self._eta_marker_info else None
+                    dest_info = self._eta_marker_info.get("destination") if self._eta_marker_info else None
+
+                    # Midpoint ETA weather icon marker
+                    if (
+                        mid_info is not None
+                        and isinstance(mid, (list, tuple))
+                        and len(mid) == 2
+                    ):
+                        mid_dt = mid_info.get("time")
+                        mid_desc = mid_info.get("desc", "")
+                        mid_time_str = (
+                            mid_dt.strftime("%Y-%m-%d %H:%M")
+                            if hasattr(mid_dt, "strftime")
+                            else ""
+                        )
+                        popup = "Midpoint ETA"
+                        if mid_time_str:
+                            popup += f"\n{mid_time_str}"
+                        if mid_desc:
+                            popup += f"\n{mid_desc}"
+                        icon = self._weather_icon_from_desc(mid_desc)
+                        _add_marker(mid[1], mid[0], "", popup, icon_type="weather", icon_html=icon)
+
+                    # Destination ETA weather icon marker
+                    if (
+                        dest_info is not None
+                        and isinstance(d, (list, tuple))
+                        and len(d) == 2
+                    ):
+                        dest_dt = dest_info.get("time")
+                        dest_desc = dest_info.get("desc", "")
+                        dest_time_str = (
+                            dest_dt.strftime("%Y-%m-%d %H:%M")
+                            if hasattr(dest_dt, "strftime")
+                            else ""
+                        )
+                        popup = "Destination ETA"
+                        if dest_time_str:
+                            popup += f"\n{dest_time_str}"
+                        if dest_desc:
+                            popup += f"\n{dest_desc}"
+                        icon = self._weather_icon_from_desc(dest_desc)
+                        _add_marker(d[1], d[0], "", popup, icon_type="weather", icon_html=icon)
+
+                except Exception:
+                    # Map markers are best-effort; do not break dispatch on marker issues.
+                    pass
 
         self._push_map(geometry, markers)
 
@@ -814,6 +959,9 @@ class MainWindow(QMainWindow):
     # -------------------------
 
     def _build_dispatch_report(self, result: PlanResult) -> str:
+        # Reset ETA marker info; will repopulate if Driver+ETA forecast is available
+        self._eta_marker_info = None
+
         origin = result.origin
         destination = result.destination
         stops = result.stops
@@ -1026,7 +1174,6 @@ class MainWindow(QMainWindow):
                     f"- Estimated fuel used (primary): {gallons_primary:.1f} gal\n"
                     f"- Estimated fuel cost (primary): ${cost_primary:.2f}\n"
                 )
-                # If primary_cost_estimate was not set earlier, ensure it is available for deltas
                 if primary_cost_estimate is None:
                     primary_cost_estimate = cost_primary
 
@@ -1072,7 +1219,39 @@ class MainWindow(QMainWindow):
                             f"Time-aligned weather forecast unavailable{stamp}:\n{e}"
                         )
 
+                    # Store ETA marker info for map rendering (Driver mode map overlay)
+                    try:
+                        mid_desc = None
+                        dest_desc = None
+                        for line in (eta_weather_text or "").splitlines():
+                            line_stripped = line.strip()
+                            if line_stripped.startswith("- Midpoint ETA"):
+                                parts = line_stripped.split("):", 1)
+                                if len(parts) == 2:
+                                    mid_desc = parts[1].strip()
+                            elif line_stripped.startswith("- Destination ETA"):
+                                parts = line_stripped.split("):", 1)
+                                if len(parts) == 2:
+                                    dest_desc = parts[1].strip()
+
+                        self._eta_marker_info = {
+                            "midpoint": {
+                                "time": eta_midpoint,
+                                "desc": mid_desc or "",
+                            },
+                            "destination": {
+                                "time": eta_dt,
+                                "desc": dest_desc or "",
+                            },
+                        }
+                    except Exception:
+                        # Best-effort; do not break report if parsing fails
+                        self._eta_marker_info = None
+
                     eta_weather_block = "\n" + eta_weather_text + "\n"
+
+                else:
+                    eta_weather_block = ""
 
             except Exception as e:
                 stamp = (
