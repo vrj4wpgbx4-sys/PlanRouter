@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from math import floor
 from pathlib import Path
 import json
@@ -18,12 +18,13 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QFormLayout,
     QLabel,
+    QGroupBox,
+    QGridLayout,
     QLineEdit,
     QPushButton,
     QListWidget,
     QTextEdit,
     QSplitter,
-    QSizePolicy,
     QComboBox,
     QSpinBox,
     QDoubleSpinBox,
@@ -37,7 +38,7 @@ APP_VERSION = "0.1.0"
 # -----------------------------------------------------------------------------
 # Import bootstrap so it works both as a package and as a flat script tree
 # -----------------------------------------------------------------------------
-_pkg_dir = Path(__file__).resolve().parents[1]  # .../route_planner_ai
+_pkg_dir = Path(__file__).resolve().parents[1]  # project root (e.g. C:\Code\PlanRouter)
 if str(_pkg_dir) not in sys.path:
     sys.path.insert(0, str(_pkg_dir))
 
@@ -67,11 +68,131 @@ except Exception:
     try:
         from route_planner_ai.conditions_client import CONDITIONS_CLIENT_VERSION  # type: ignore
     except Exception:
-        CONDITIONS_CLIENT_VERSION = None  # type: ignore
+        CONDITIONS_CLIENT_VERSION = "unknown"
 
 
 # -----------------------------------------------------------------------------
-# Worker plumbing
+# Map HTML (Leaflet, no integrity attributes)
+# -----------------------------------------------------------------------------
+
+MAP_HTML = """<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Route Map</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    html, body { height: 100%; margin: 0; }
+    #map { height: 100%; width: 100%; }
+    .stop-label {
+      background: white;
+      border: 1px solid #444;
+      border-radius: 10px;
+      padding: 2px 7px;
+      font-size: 12px;
+      font-weight: 800;
+    }
+    .weather-icon {
+      background: transparent;
+      border: none;
+      font-size: 18px;
+    }
+  </style>
+</head>
+<body>
+<div id="map"></div>
+<script>
+  var map = L.map('map').setView([46.87, -113.99], 6);
+
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap contributors'
+  }).addTo(map);
+
+  function clearLayers() {
+    if (window._routeLayer) {
+      map.removeLayer(window._routeLayer);
+      window._routeLayer = null;
+    }
+    if (window._markerLayerGroup) {
+      map.removeLayer(window._markerLayerGroup);
+      window._markerLayerGroup = null;
+    }
+  }
+
+  function renderRoute(geojson, markers) {
+    clearLayers();
+
+    if (geojson && geojson.coordinates && geojson.coordinates.length > 0) {
+      window._routeLayer = L.geoJSON(geojson).addTo(map);
+    }
+
+    if (markers && markers.length > 0) {
+      window._markerLayerGroup = L.layerGroup().addTo(map);
+      markers.forEach(function(m) {
+        const lat = m.lat;
+        const lon = m.lon;
+        const label = m.label || "";
+        const popupText = m.popup || "";
+        const iconType = m.icon_type || "stop";
+        const iconHtml = m.icon_html || "";
+
+        if (iconType === "weather" && iconHtml) {
+          const icon = L.divIcon({
+            className: 'weather-icon',
+            html: iconHtml,
+            iconSize: [24, 24],
+            iconAnchor: [12, 12]
+          });
+          const marker = L.marker([lat, lon], { icon: icon });
+          if (popupText) {
+            marker.bindPopup(popupText);
+          }
+          marker.addTo(window._markerLayerGroup);
+        } else {
+          const circleMarker = L.circleMarker([lat, lon], {
+            radius: 6,
+            weight: 2,
+            color: '#0044cc',
+            fillColor: '#66a3ff',
+            fillOpacity: 0.9
+          });
+          if (popupText) {
+            circleMarker.bindPopup(popupText);
+          }
+          circleMarker.addTo(window._markerLayerGroup);
+
+          if (label) {
+            const labelIcon = L.divIcon({
+              className: 'stop-label',
+              html: label,
+              iconAnchor: [10, 10]
+            });
+            const labelMarker = L.marker([lat, lon], { icon: labelIcon });
+            labelMarker.addTo(window._markerLayerGroup);
+          }
+        }
+      });
+    }
+
+    if (window._routeLayer) {
+      map.fitBounds(window._routeLayer.getBounds(), { padding: [20, 20] });
+    } else if (window._markerLayerGroup) {
+      map.fitBounds(window._markerLayerGroup.getBounds(), { padding: [20, 20] });
+    }
+  }
+
+  window.renderRoute = renderRoute;
+</script>
+</body>
+</html>
+"""
+
+
+# -----------------------------------------------------------------------------
+# Worker signals / models
 # -----------------------------------------------------------------------------
 
 class _WorkerSignals(QObject):
@@ -127,18 +248,33 @@ class PlanWorker(QRunnable):
 
             # Traffic client is optional
             try:
-                traffic_client = TrafficClient()
-                traffic_client_error = ""
+                traffic_client: Optional[TrafficClient] = TrafficClient()
+                traffic_client_error: Optional[str] = None
             except Exception as e:
                 traffic_client = None
                 traffic_client_error = str(e)
 
             # ---------------- Routing ----------------
-            self.signals.started.emit("Planning route(s)...")
+            self.signals.started.emit("Planning route...")
+
             try:
-                if stops and hasattr(client, "get_route_with_stops"):
-                    # Multi-drop behavior stays unchanged.
-                    plan = client.get_route_with_stops(origin, stops, destination)  # type: ignore
+                if stops:
+                    # Multi-drop / stop-based route.
+                    if mode == "driver":
+                        # In Driver mode, ask provider for alternatives if supported.
+                        try:
+                            plan = client.get_route_with_stops(
+                                origin,
+                                stops,
+                                destination,
+                                alternatives=True,  # type: ignore
+                            )
+                        except TypeError:
+                            # Legacy signature without alternatives.
+                            plan = client.get_route_with_stops(origin, stops, destination)  # type: ignore
+                    else:
+                        # Multi-drop behavior stays unchanged.
+                        plan = client.get_route_with_stops(origin, stops, destination)  # type: ignore
                     stop_based = True
                 else:
                     stop_based = False
@@ -173,10 +309,17 @@ class PlanWorker(QRunnable):
                         origin_lat, origin_lon, dest_lat, dest_lon
                     )
                 else:
-                    weather_summary = "Weather lookup not available:\nRouting client has no geocode()."
+                    stamp = f" [{CONDITIONS_CLIENT_VERSION}]" if CONDITIONS_CLIENT_VERSION else ""
+                    weather_summary = (
+                        f"Weather lookup not available{stamp}:\n"
+                        "- Routing client has no geocode()."
+                    )
             except (RoutingError, ConditionsError) as e:
                 stamp = f" [{CONDITIONS_CLIENT_VERSION}]" if CONDITIONS_CLIENT_VERSION else ""
-                weather_summary = f"Weather lookup not available{stamp}:\n{e}"
+                weather_summary = (
+                    f"Weather lookup not available{stamp}:\n"
+                    f"- {e}"
+                )
             except Exception as e:
                 stamp = f" [{CONDITIONS_CLIENT_VERSION}]" if CONDITIONS_CLIENT_VERSION else ""
                 weather_summary = f"Weather lookup not available{stamp}:\n{type(e).__name__}: {e}"
@@ -207,12 +350,12 @@ class PlanWorker(QRunnable):
                         f"- Traffic client unavailable: {traffic_client_error}"
                     )
 
-                # Risk
+                # Risk scoring
                 risk_actions: List[str] = []
                 try:
                     try:
-                        # 4-return signature: score, label, explanation, actions
-                        score, label, explanation, risk_actions = compute_route_risk(
+                        # 5-return signature (score, label, explanation, actions, stats)
+                        score, label, explanation, risk_actions, _stats = compute_route_risk(
                             miles,
                             minutes,
                             weather_summary,
@@ -262,10 +405,10 @@ class PlanWorker(QRunnable):
                 weather_summary=weather_summary,
                 per_route=per_route,
             )
-            self.signals.finished.emit(result)
 
+            self.signals.finished.emit(result)
         except Exception as e:
-            self.signals.failed.emit(f"Unexpected error:\n\n{type(e).__name__}: {e}")
+            self.signals.failed.emit(f"Unexpected planning error:\n\n{e}")
 
 
 # -----------------------------------------------------------------------------
@@ -285,17 +428,14 @@ class StopRow(QWidget):
         self.input.setPlaceholderText("Stop (City, ST / address / ZIP)")
 
         self.remove_btn = QPushButton("Remove")
-        self.remove_btn.clicked.connect(self._on_remove)
+        self.remove_btn.clicked.connect(self._on_remove_clicked)
 
-        layout.addWidget(self.input)
+        layout.addWidget(self.input, stretch=1)
         layout.addWidget(self.remove_btn)
         self.setLayout(layout)
 
-    def _on_remove(self):
+    def _on_remove_clicked(self) -> None:
         self._remove_callback(self)
-
-    def value(self) -> str:
-        return self.input.text().strip()
 
 
 # -----------------------------------------------------------------------------
@@ -318,21 +458,19 @@ class MainWindow(QMainWindow):
         self._stop_rows: List[StopRow] = []
         self._current_routes: List[Dict[str, Any]] = []
         self._last_plan: Optional[PlanResult] = None
+        self._eta_marker_info: Optional[Dict[str, Any]] = None
 
         self._threadpool = QThreadPool.globalInstance()
-        self._plan_button_enabled = True
+        self._plan_button_enabled: bool = True
 
-        # Map refresh controls
-        self._map_ready: bool = False
-        self._pending_map_payload: Optional[Tuple[Any, List[Dict[str, Any]], int]] = None
-        self._map_nonce: int = 0
+        self._build_ui()
 
-        # Driver ETA-weather marker info for map
-        # {
-        #   "midpoint": {"time": datetime, "desc": str},
-        #   "destination": {"time": datetime, "desc": str}
-        # }
-        self._eta_marker_info: Optional[Dict[str, Any]] = None
+    # -------------------------------------------------------------------------
+    # UI construction
+    # -------------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        splitter = QSplitter(Qt.Horizontal)
 
         # ---------------- Left Panel ----------------
         left = QWidget()
@@ -352,23 +490,32 @@ class MainWindow(QMainWindow):
         mode_row.addStretch(1)
         left_layout.addLayout(mode_row)
 
-        # Average speed
-        speed_row = QHBoxLayout()
-        speed_label = QLabel("Average Speed (mph):")
-        self.speed_input = QSpinBox()
-        self.speed_input.setRange(20, 85)
-        self.speed_input.setValue(self._avg_speed_mph)
-        self.speed_input.valueChanged.connect(self._on_speed_changed)
-        speed_row.addWidget(speed_label)
-        speed_row.addWidget(self.speed_input)
-        speed_row.addStretch(1)
-        left_layout.addLayout(speed_row)
+        # Driver controls: avg speed, MPG, fuel price, departure date/time
+        driver_row = QHBoxLayout()
+        driver_label = QLabel("Driver settings (when in Driver mode):")
+        driver_row.addWidget(driver_label)
+        driver_row.addStretch(1)
+        left_layout.addLayout(driver_row)
 
-        # Truck MPG (Driver fuel model)
+        # Average speed
+        avg_speed_row = QHBoxLayout()
+        avg_speed_label = QLabel("Average speed (mph):")
+        self.avg_speed_input = QSpinBox()
+        self.avg_speed_input.setRange(30, 85)
+        self.avg_speed_input.setSingleStep(5)
+        self.avg_speed_input.setValue(self._avg_speed_mph)
+        self.avg_speed_input.valueChanged.connect(self._on_avg_speed_changed)
+        avg_speed_row.addWidget(avg_speed_label)
+        avg_speed_row.addWidget(self.avg_speed_input)
+        avg_speed_row.addStretch(1)
+        left_layout.addLayout(avg_speed_row)
+
+        # MPG
         mpg_row = QHBoxLayout()
-        mpg_label = QLabel("Truck MPG:")
+        mpg_label = QLabel("Truck fuel economy (mpg):")
         self.mpg_input = QSpinBox()
-        self.mpg_input.setRange(3, 15)
+        self.mpg_input.setRange(3, 12)
+        self.mpg_input.setSingleStep(1)
         self.mpg_input.setValue(self._mpg)
         self.mpg_input.valueChanged.connect(self._on_mpg_changed)
         mpg_row.addWidget(mpg_label)
@@ -418,9 +565,11 @@ class MainWindow(QMainWindow):
         form.addRow(QLabel("Destination:"), self.destination_input)
         left_layout.addLayout(form)
 
-        # Stops header + add button
+        # Stops header
         stops_header = QHBoxLayout()
-        stops_header.addWidget(QLabel("Stops (optional, multi-drop):"))
+        stops_label = QLabel("Stops (optional, in order):")
+        stops_header.addWidget(stops_label)
+
         self.add_stop_btn = QPushButton("+ Add Stop")
         self.add_stop_btn.clicked.connect(self._add_stop_row)
         stops_header.addWidget(self.add_stop_btn)
@@ -450,17 +599,50 @@ class MainWindow(QMainWindow):
 
         left_layout.addLayout(actions)
 
-        # Routes list
-        left_layout.addWidget(QLabel("Routes:"))
+        # Route list
         self.route_list = QListWidget()
         self.route_list.currentRowChanged.connect(self._on_route_selected)
-        self.route_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         left_layout.addWidget(self.route_list, stretch=1)
+
+        splitter.addWidget(left)
 
         # ---------------- Right Panel ----------------
         right = QWidget()
         right_layout = QVBoxLayout()
         right.setLayout(right_layout)
+
+        # Route summary panel
+        self.summary_group = QGroupBox("Route Summary")
+        summary_layout = QGridLayout()
+        self.summary_group.setLayout(summary_layout)
+
+        self.summary_distance_label = QLabel("Distance:")
+        self.summary_distance_value = QLabel("—")
+
+        self.summary_duration_label = QLabel("Drive time:")
+        self.summary_duration_value = QLabel("—")
+
+        self.summary_risk_label = QLabel("Risk:")
+        self.summary_risk_value = QLabel("—")
+
+        self.summary_eta_label = QLabel("ETA (driver):")
+        self.summary_eta_value = QLabel("—")
+
+        self.summary_fuel_label = QLabel("Fuel (est):")
+        self.summary_fuel_value = QLabel("—")
+
+        summary_layout.addWidget(self.summary_distance_label, 0, 0)
+        summary_layout.addWidget(self.summary_distance_value, 0, 1)
+        summary_layout.addWidget(self.summary_duration_label, 1, 0)
+        summary_layout.addWidget(self.summary_duration_value, 1, 1)
+        summary_layout.addWidget(self.summary_risk_label, 2, 0)
+        summary_layout.addWidget(self.summary_risk_value, 2, 1)
+        summary_layout.addWidget(self.summary_eta_label, 3, 0)
+        summary_layout.addWidget(self.summary_eta_value, 3, 1)
+        summary_layout.addWidget(self.summary_fuel_label, 4, 0)
+        summary_layout.addWidget(self.summary_fuel_value, 4, 1)
+
+        right_layout.addWidget(self.summary_group)
 
         # Map view
         self.map_view = QWebEngineView()
@@ -473,9 +655,6 @@ class MainWindow(QMainWindow):
         self.conditions_text.setPlaceholderText("Dispatch report will appear here...")
         right_layout.addWidget(self.conditions_text, stretch=1)
 
-        # Splitter
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(left)
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -491,197 +670,25 @@ class MainWindow(QMainWindow):
 
         # Initialize driver-specific control states
         self._update_depart_controls_enabled()
+        self._reset_summary_panel()
 
-    # -------------------------
-    # Map
-    # -------------------------
-
-    def _load_map(self) -> None:
-        self._map_ready = False
-        html = """
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>Route Map</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <style>
-    html, body { height: 100%; margin: 0; }
-    #map { height: 100%; width: 100%; }
-    .stop-label {
-      background: white;
-      border: 1px solid #444;
-      border-radius: 10px;
-      padding: 2px 7px;
-      font-size: 12px;
-      font-weight: 800;
-    }
-    .weather-icon {
-      background: transparent;
-      border: none;
-      font-size: 20px;
-      text-align: center;
-    }
-  </style>
-</head>
-<body>
-<div id="map"></div>
-<script>
-  const map = L.map('map').setView([46.8721, -113.9940], 6);
-
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 19,
-    attribution: '&copy; OpenStreetMap'
-  }).addTo(map);
-
-  let routeLayer = null;
-  let markerLayer = L.layerGroup().addTo(map);
-
-  function clearAll() {
-    if (routeLayer) {
-      map.removeLayer(routeLayer);
-      routeLayer = null;
-    }
-    markerLayer.clearLayers();
-  }
-
-  function addMarker(m) {
-    const lat = m.lat;
-    const lon = m.lon;
-    const label = m.label || "";
-    const popupText = m.popup || "";
-    const iconType = m.icon_type || "stop";
-    const iconHtml = m.icon_html || "";
-
-    if (iconType === "weather" && iconHtml) {
-      const icon = L.divIcon({
-        className: 'weather-icon',
-        html: iconHtml,
-        iconSize: [24, 24],
-        iconAnchor: [12, 12]
-      });
-      const marker = L.marker([lat, lon], { icon }).addTo(markerLayer);
-      if (popupText) {
-        marker.bindPopup(popupText);
-      }
-      return;
-    }
-
-    // Default: normal marker + label bubble
-    const mBase = L.marker([lat, lon]).addTo(markerLayer);
-    if (popupText) {
-      mBase.bindPopup(popupText);
-    }
-
-    if (label) {
-      const icon = L.divIcon({
-        className: 'stop-label',
-        html: label,
-        iconSize: [24, 24],
-        iconAnchor: [12, 12]
-      });
-      L.marker([lat, lon], { icon }).addTo(markerLayer);
-    }
-  }
-
-  window.setRouteAndMarkers = function(coords, markers, nonce) {
-    const _ = nonce;
-    clearAll();
-
-    if (coords && coords.length >= 2) {
-      const latlon = coords.map(pt => [pt[1], pt[0]]);
-      routeLayer = L.polyline(latlon, { weight: 5 }).addTo(map);
-      map.fitBounds(routeLayer.getBounds(), { padding: [20, 20] });
-    }
-
-    if (markers && markers.length) {
-      for (const m of markers) {
-        addMarker(m);
-      }
-    }
-  }
-</script>
-</body>
-</html>
-"""
-        self.map_view.loadFinished.connect(self._on_map_load_finished)
-        self.map_view.setHtml(html, baseUrl=QUrl("https://local.map/"))
-
-    def _on_map_load_finished(self, ok: bool) -> None:
-        self._map_ready = bool(ok)
-        if not self._map_ready:
-            return
-        if self._pending_map_payload is None:
-            return
-        geometry, markers, nonce = self._pending_map_payload
-        self._pending_map_payload = None
-        self._push_map_now(geometry, markers, nonce)
-
-    def _push_map(self, route_geometry: Any, markers: List[Dict[str, Any]]) -> None:
-        self._map_nonce += 1
-        nonce = self._map_nonce
-
-        if not self._map_ready:
-            self._pending_map_payload = (route_geometry, markers, nonce)
-            return
-
-        self._push_map_now(route_geometry, markers, nonce)
-
-    def _push_map_now(self, route_geometry: Any, markers: List[Dict[str, Any]], nonce: int) -> None:
-        coords: List[Any] = []
-        if isinstance(route_geometry, dict) and isinstance(route_geometry.get("coordinates"), list):
-            coords = route_geometry["coordinates"]
-
-        js_coords = json.dumps(coords)
-        js_markers = json.dumps(markers)
-        self.map_view.page().runJavaScript(
-            f"window.setRouteAndMarkers({js_coords}, {js_markers}, {int(nonce)});"
-        )
-
-    # -------------------------
-    # Stops UI
-    # -------------------------
-
-    def _add_stop_row(self):
-        row = StopRow(remove_callback=self._remove_stop_row)
-        self._stop_rows.append(row)
-        self.stops_layout.addWidget(row)
-
-    def _remove_stop_row(self, row):
-        if row in self._stop_rows:
-            self._stop_rows.remove(row)
-        row.setParent(None)
-        row.deleteLater()
-
-    def _collect_stops(self) -> List[str]:
-        return [r.value() for r in self._stop_rows if r.value()]
-
-    def _clear_all_stops(self) -> None:
-        for row in list(self._stop_rows)[::-1]:
-            self._remove_stop_row(row)
-
-    # -------------------------
-    # Mode / speed / fuel controls
-    # -------------------------
-
-    def _update_depart_controls_enabled(self) -> None:
-        enabled = self._mode == "driver"
-        self.depart_date_edit.setEnabled(enabled)
-        self.depart_time_edit.setEnabled(enabled)
-        self.mpg_input.setEnabled(enabled)
-        self.fuel_price_input.setEnabled(enabled)
+    # -------------------------------------------------------------------------
+    # Mode / driver param handlers
+    # -------------------------------------------------------------------------
 
     def _on_mode_changed(self, index: int) -> None:
-        text = self.mode_combo.currentText().strip().lower()
-        if text.startswith("driver"):
-            self._mode = "driver"
-        else:
-            self._mode = "dispatcher"
+        self._mode = "dispatcher" if index == 0 else "driver"
         self._update_depart_controls_enabled()
 
-    def _on_speed_changed(self, value: int) -> None:
+    def _update_depart_controls_enabled(self) -> None:
+        is_driver = (self._mode == "driver")
+        self.avg_speed_input.setEnabled(is_driver)
+        self.mpg_input.setEnabled(is_driver)
+        self.fuel_price_input.setEnabled(is_driver)
+        self.depart_date_edit.setEnabled(is_driver)
+        self.depart_time_edit.setEnabled(is_driver)
+
+    def _on_avg_speed_changed(self, value: int) -> None:
         self._avg_speed_mph = int(value)
 
     def _on_mpg_changed(self, value: int) -> None:
@@ -690,37 +697,49 @@ class MainWindow(QMainWindow):
     def _on_fuel_price_changed(self, value: float) -> None:
         self._fuel_price = float(value)
 
-    # -------------------------
+    # -------------------------------------------------------------------------
     # Actions
-    # -------------------------
+    # -------------------------------------------------------------------------
 
     def on_plan_route_clicked(self) -> None:
         origin = self.origin_input.text().strip()
         destination = self.destination_input.text().strip()
-        stops = self._collect_stops()
+
+        stops: List[str] = []
+        for row in self._stop_rows:
+            text = row.input.text().strip()
+            if text:
+                stops.append(text)
 
         if not origin or not destination:
-            self.conditions_text.setPlainText("Please enter both origin and destination.")
+            self.conditions_text.setPlainText("Please provide both origin and destination.")
             return
 
         if not self._plan_button_enabled:
+            self.conditions_text.setPlainText("A route is already being planned. Please wait.")
             return
 
-        self._plan_button_enabled = True
+        payload = PlanInput(
+            origin=origin,
+            destination=destination,
+            stops=stops,
+            mode=self._mode,
+        )
+
+        self._plan_button_enabled = False
         self.plan_btn.setEnabled(False)
 
         self.route_list.clear()
         self._current_routes = []
         self._last_plan = None
         self._eta_marker_info = None
+        self._reset_summary_panel()
         self.conditions_text.setPlainText("Starting...")
 
         # Clear map on new run
         self._push_map({"type": "LineString", "coordinates": []}, [])
 
-        worker = PlanWorker(
-            PlanInput(origin=origin, destination=destination, stops=stops, mode=self._mode)
-        )
+        worker = PlanWorker(payload)
         worker.signals.started.connect(self._on_worker_status)
         worker.signals.failed.connect(self._on_worker_failed)
         worker.signals.finished.connect(self._on_worker_finished)
@@ -741,6 +760,7 @@ class MainWindow(QMainWindow):
 
         self.route_list.clear()
         self.conditions_text.setPlainText("Cleared. Enter a new route and click 'Plan Route'.")
+        self._reset_summary_panel()
 
         self._push_map({"type": "LineString", "coordinates": []}, [])
 
@@ -749,6 +769,7 @@ class MainWindow(QMainWindow):
 
     def _on_worker_failed(self, msg: str) -> None:
         self.conditions_text.setPlainText(msg)
+        self._reset_summary_panel()
         self.plan_btn.setEnabled(True)
         self._plan_button_enabled = True
 
@@ -778,40 +799,122 @@ class MainWindow(QMainWindow):
 
         # Always compute the report first so ETA marker info is available
         self.conditions_text.setPlainText(self._build_dispatch_report(result))
+        self._update_summary_panel_from_plan(result)
 
         if self._current_routes:
-            # Select primary and render it with markers (including ETA-weather markers if available)
             self.route_list.setCurrentRow(0)
             self._render_selected_route(0)
 
         self.plan_btn.setEnabled(True)
         self._plan_button_enabled = True
 
-    # -------------------------
+    # -------------------------------------------------------------------------
+    # Summary panel helpers
+    # -------------------------------------------------------------------------
+
+    def _reset_summary_panel(self) -> None:
+        if not hasattr(self, "summary_distance_value"):
+            return
+        self.summary_distance_value.setText("—")
+        self.summary_duration_value.setText("—")
+        self.summary_risk_value.setText("—")
+        self.summary_eta_value.setText("—")
+        self.summary_fuel_value.setText("—")
+
+    def _update_summary_panel_from_plan(self, result: PlanResult) -> None:
+        if not hasattr(self, "summary_distance_value"):
+            return
+
+        routes = result.routes or []
+        per_route = result.per_route or []
+
+        primary_summary = (routes[0].get("summary", {}) if routes else {}) or {}
+        miles_primary = float(primary_summary.get("distance_miles", 0.0) or 0.0)
+        minutes_primary = float(primary_summary.get("duration_minutes", 0.0) or 0.0)
+
+        # Distance / duration
+        if miles_primary > 0:
+            self.summary_distance_value.setText(f"{miles_primary:.1f} miles")
+        else:
+            self.summary_distance_value.setText("—")
+
+        if minutes_primary > 0:
+            hours = int(minutes_primary // 60)
+            mins = int(round(minutes_primary - hours * 60))
+            self.summary_duration_value.setText(f"{hours}h {mins}m")
+        else:
+            self.summary_duration_value.setText("—")
+
+        # Risk (primary route)
+        if per_route and per_route[0]:
+            pr0 = per_route[0]
+            label = str(pr0.get("risk_label", "UNKNOWN"))
+            score = int(pr0.get("risk_score", 0) or 0)
+            self.summary_risk_value.setText(f"{label} ({score}/100)")
+        else:
+            self.summary_risk_value.setText("—")
+
+        # Driver-mode ETA and fuel
+        if self._mode == "driver" and miles_primary > 0 and self._avg_speed_mph > 0:
+            try:
+                depart_date = self.depart_date_edit.date()
+                depart_time = self.depart_time_edit.time()
+                depart_dt = datetime(
+                    depart_date.year(),
+                    depart_date.month(),
+                    depart_date.day(),
+                    depart_time.hour(),
+                    depart_time.minute(),
+                )
+                drive_hours = miles_primary / float(self._avg_speed_mph)
+                drive_minutes = int(round(drive_hours * 60.0))
+                eta_dt = depart_dt + timedelta(minutes=drive_minutes)
+                eta_str = eta_dt.strftime("%Y-%m-%d %H:%M")
+                self.summary_eta_value.setText(eta_str)
+            except Exception:
+                self.summary_eta_value.setText("—")
+        else:
+            self.summary_eta_value.setText("—")
+
+        if (
+            self._mode == "driver"
+            and miles_primary > 0
+            and self._mpg > 0
+            and self._fuel_price > 0
+        ):
+            try:
+                gallons = miles_primary / float(self._mpg)
+                cost = gallons * self._fuel_price
+                self.summary_fuel_value.setText(f"{gallons:.1f} gal (~${cost:.2f})")
+            except Exception:
+                self.summary_fuel_value.setText("—")
+        else:
+            self.summary_fuel_value.setText("—")
+
+    # -------------------------------------------------------------------------
     # Weather icon helper
-    # -------------------------
+    # -------------------------------------------------------------------------
 
     @staticmethod
     def _weather_icon_from_desc(desc: str) -> str:
-        """Return an emoji icon based on a short weather description."""
         text = (desc or "").lower()
         if "snow" in text or "flurries" in text or "sleet" in text or "blizzard" in text:
             return "❄️"
         if "thunder" in text or "storm" in text:
             return "⛈️"
-        if "rain" in text or "showers" in text or "drizzle" in text:
+        if "rain" in text or "shower" in text or "drizzle" in text:
             return "🌧️"
-        if "overcast" in text or "cloudy" in text:
+        if "fog" in text or "mist" in text:
+            return "🌫️"
+        if "cloud" in text or "overcast" in text:
             return "☁️"
-        if "clear" in text or "sunny" in text:
-            return "☀️"
-        if "wind" in text or "breeze" in text or "gust" in text:
+        if "wind" in text or "breezy" in text or "gust" in text:
             return "💨"
         return "🌡️"
 
-    # -------------------------
+    # -------------------------------------------------------------------------
     # Route selection + map rendering
-    # -------------------------
+    # -------------------------------------------------------------------------
 
     def _on_route_selected(self, row: int) -> None:
         if row < 0:
@@ -835,7 +938,7 @@ class MainWindow(QMainWindow):
             label: str,
             popup: str,
             icon_type: str = "stop",
-            icon_html: Optional[str] = None,
+            icon_html: str = "",
         ) -> None:
             markers.append(
                 {
@@ -857,7 +960,7 @@ class MainWindow(QMainWindow):
         dest_txt = self._last_plan.destination
         stops_txt = self._last_plan.stops or []
 
-        # Base O / stops / D markers via geocoding (stop markers remain labeled)
+        # Base O / stops / D markers via geocoding
         if client is not None and hasattr(client, "geocode"):
             try:
                 o_lat, o_lon = client.geocode(origin_txt)  # type: ignore
@@ -878,7 +981,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        # Fallback O / D markers from geometry if geocode fails everywhere
+        # Fallback O / D markers from geometry if geocode fails
         if not markers and isinstance(geometry, dict) and isinstance(geometry.get("coordinates"), list):
             coords = geometry["coordinates"]
             if len(coords) >= 2:
@@ -889,7 +992,7 @@ class MainWindow(QMainWindow):
                 if isinstance(d, (list, tuple)) and len(d) == 2:
                     _add_marker(d[1], d[0], "D", f"Destination: {dest_txt}", icon_type="stop")
 
-        # ETA weather markers (Driver mode only) as icons, no M/E letters
+        # ETA weather markers (Driver mode only)
         if (
             self._mode == "driver"
             and self._eta_marker_info is not None
@@ -906,7 +1009,6 @@ class MainWindow(QMainWindow):
                     mid_info = self._eta_marker_info.get("midpoint") if self._eta_marker_info else None
                     dest_info = self._eta_marker_info.get("destination") if self._eta_marker_info else None
 
-                    # Midpoint ETA weather icon marker
                     if (
                         mid_info is not None
                         and isinstance(mid, (list, tuple))
@@ -927,7 +1029,6 @@ class MainWindow(QMainWindow):
                         icon = self._weather_icon_from_desc(mid_desc)
                         _add_marker(mid[1], mid[0], "", popup, icon_type="weather", icon_html=icon)
 
-                    # Destination ETA weather icon marker
                     if (
                         dest_info is not None
                         and isinstance(d, (list, tuple))
@@ -949,17 +1050,15 @@ class MainWindow(QMainWindow):
                         _add_marker(d[1], d[0], "", popup, icon_type="weather", icon_html=icon)
 
                 except Exception:
-                    # Map markers are best-effort; do not break dispatch on marker issues.
                     pass
 
         self._push_map(geometry, markers)
 
-    # -------------------------
+    # -------------------------------------------------------------------------
     # Dispatch Report
-    # -------------------------
+    # -------------------------------------------------------------------------
 
     def _build_dispatch_report(self, result: PlanResult) -> str:
-        # Reset ETA marker info; will repopulate if Driver+ETA forecast is available
         self._eta_marker_info = None
 
         origin = result.origin
@@ -977,30 +1076,70 @@ class MainWindow(QMainWindow):
         hours_primary = floor(minutes_primary / 60) if minutes_primary else 0
         mins_primary = int(round(minutes_primary - hours_primary * 60)) if minutes_primary else 0
 
-        geom = routes[0].get("geometry") if routes else None
-        geometry_info = "coordinates (LineString)" if isinstance(geom, dict) else "not available"
+        lines: List[str] = []
 
-        threshold = 3.0
-        if isinstance(sanity, dict) and "ratio" in sanity and "threshold" in sanity:
-            ratio = sanity.get("ratio")
-            threshold = float(sanity.get("threshold", 3.0) or 3.0)
-            straight = sanity.get("straight_line_miles", "N/A")
-            sanity_line = (
-                f"Sanity check: PASS ({ratio}×, threshold {threshold}×) | "
-                f"Straight-line: {straight} miles"
+        utc_now = datetime.now(timezone.utc)
+        lines.append("=== DISPATCH REPORT ===")
+        lines.append(f"Dispatch timestamp: {utc_now.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        lines.append(f"Route ID: {uuid.uuid4()}")
+        lines.append("")
+
+        # Trip overview
+        lines.append("Trip overview:")
+        if stops:
+            lines.append(f"- Origin:      {origin}")
+            lines.append(f"- Destination: {destination}")
+            lines.append(f"- Stops:       {', '.join(stops)}")
+            lines.append("")
+        else:
+            lines.append(f"- Direct route from {origin} to {destination}")
+            lines.append("")
+
+        if result.stop_based:
+            lines.append("Route structure:")
+            lines.append("- Multi-drop / stop-based route (stops treated as required waypoints).")
+            lines.append("")
+        else:
+            lines.append("Route structure:")
+            lines.append("- Direct or optimized routing (stops treated as via-points if present).")
+            lines.append("")
+
+        # Primary route
+        lines.append("Primary route (dispatcher view):")
+        if miles_primary > 0 and minutes_primary > 0:
+            lines.append(
+                f"- Distance: {miles_primary:.1f} miles\n"
+                f"- Drive time: {hours_primary}h {mins_primary}m"
             )
         else:
-            sanity_line = f"Sanity safeguard: ACTIVE ({threshold}× straight-line anomaly block)"
+            lines.append("- No primary route distance/time available yet.")
+        lines.append("")
 
-        now = datetime.now()
-        dispatch_timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
-        route_id = str(uuid.uuid4())[:8]
-        trip_type = "Multi-drop" if stops else "Direct"
+        # Sanity check
+        if sanity:
+            ok = bool(sanity.get("ok", True))
+            ratio = float(sanity.get("ratio", 0.0) or 0.0)
+            straight = float(sanity.get("straight_line_miles", 0.0) or 0.0)
+            routed = float(sanity.get("routed_distance_miles", 0.0) or 0.0)
+            lines.append("Distance sanity check:")
+            lines.append(f"- Straight line: {straight:.1f} miles")
+            lines.append(f"- Routed:        {routed:.1f} miles")
+            lines.append(f"- Ratio:         {ratio:.2f}x vs straight line")
+            lines.append(f"- Status:        {'OK' if ok else 'SUSPICIOUS'}")
+            lines.append("")
+        else:
+            lines.append("Distance sanity check:")
+            lines.append("- No sanity-check data returned.")
+            lines.append("")
 
-        # Tolls block
-        toll_block = "Tolls:\n"
-        if isinstance(toll_info, dict) and toll_info.get("available"):
-            toll_block += f"- {toll_info.get('detail') or 'Toll info available.'}\n"
+        # Toll info
+        toll_block = "Toll information:\n"
+        if toll_info.get("available"):
+            note = toll_info.get("note", "Toll info available.")
+            toll_block += f"- {note}\n"
+            details = toll_info.get("details")
+            if details:
+                toll_block += f"- Details: {details}\n"
         else:
             toll_block += "- Toll info not available from routing service for this profile/region.\n"
 
@@ -1009,15 +1148,11 @@ class MainWindow(QMainWindow):
         actions_block = ""
         route_lines: List[str] = []
 
-        # For delta comparisons
         primary_risk_score: Optional[int] = None
-        primary_cost_estimate: Optional[float] = None
         miles_list: List[float] = []
         minutes_list: List[float] = []
-        score_list: List[int] = []
-        fuel_cost_list: List[Optional[float]] = []
 
-        # Per-route summary (distance, risk, fuel if Driver)
+        # Per-route summary
         best_choice: Optional[Tuple[int, float, int, str, str]] = None
 
         for idx, route in enumerate(routes):
@@ -1034,19 +1169,10 @@ class MainWindow(QMainWindow):
             expl = str(pr.get("risk_explanation", ""))
             actions = pr.get("risk_actions", []) or []
 
-            # Store for deltas
             miles_list.append(miles)
             minutes_list.append(minutes)
-            score_list.append(score)
 
-            gallons = None
-            cost = None
-            if self._mode == "driver" and self._mpg > 0 and self._fuel_price > 0 and miles > 0:
-                gallons = miles / float(self._mpg)
-                cost = gallons * self._fuel_price
-            fuel_cost_list.append(cost)
-
-            # Route naming respects Driver / Dispatcher mode
+            # Route naming
             if self._mode == "driver":
                 if idx == 0:
                     route_name = "Route 1 (Primary)"
@@ -1057,17 +1183,11 @@ class MainWindow(QMainWindow):
             else:
                 route_name = f"Route {idx + 1}"
 
-            # Fuel estimate per route (Driver mode only)
-            fuel_info_str = ""
-            if gallons is not None and cost is not None:
-                fuel_info_str = f"; est fuel {gallons:.1f} gal, ~${cost:.2f}"
-
             route_lines.append(
                 f"- {route_name}: {miles:.1f} miles, {hours}h {mins}m — "
-                f"Risk {label} ({score}/100); {expl}{fuel_info_str}"
+                f"Risk {label} ({score}/100); {expl}"
             )
 
-            # Primary route details
             if idx == 0:
                 traffic_summary_primary = traffic_summary
                 risk_text_primary = (
@@ -1082,8 +1202,6 @@ class MainWindow(QMainWindow):
                         + "\n"
                     )
                 primary_risk_score = score
-                if cost is not None:
-                    primary_cost_estimate = cost
 
             candidate = (score, miles, idx, label, expl)
             if best_choice is None:
@@ -1094,272 +1212,204 @@ class MainWindow(QMainWindow):
                 ):
                     best_choice = candidate
 
-        # Recommended route block
-        recommended_block = ""
-        fuel_best_suffix = ""
-        if best_choice:
-            score, miles, idx, label, expl = best_choice
-            if self._mode == "driver":
-                if idx == 0:
-                    best_name = "Route 1 (Primary)"
-                elif idx == 1:
-                    best_name = "Route 2 (Alternate)"
-                else:
-                    best_name = f"Route {idx + 1}"
+        # Route options summary
+        lines.append("Route options summary:")
+        if route_lines:
+            lines.extend(route_lines)
+        else:
+            lines.append("- No route options available from service.")
+        lines.append("")
+
+        # Preferred route decision
+        if best_choice is not None:
+            best_score, best_miles, best_idx, best_label, best_expl = best_choice
+            if best_idx == 0:
+                choice_name = "Primary route appears acceptable."
             else:
-                best_name = f"Route {idx + 1}"
+                if self._mode == "driver":
+                    choice_name = f"Alternate route {best_idx + 1} is suggested."
+                else:
+                    choice_name = f"Alternate route {best_idx + 1} is suggested."
+            lines.append("Routing decision guidance:")
+            lines.append(f"- {choice_name}")
+            lines.append(f"- Rationale: {best_label} risk ({best_score}/100); {best_expl}")
+            lines.append("")
+        else:
+            lines.append("Routing decision guidance:")
+            lines.append("- No clear preferred route (insufficient data).")
+            lines.append("")
 
-            if (
-                self._mode == "driver"
-                and self._mpg > 0
-                and self._fuel_price > 0
-                and miles > 0
-            ):
-                gallons_best = miles / float(self._mpg)
-                cost_best = gallons_best * self._fuel_price
-                fuel_best_suffix = f"; est fuel {gallons_best:.1f} gal, ~${cost_best:.2f}"
+        # Traffic + risk text for primary
+        if traffic_summary_primary:
+            lines.append("Traffic & delay summary (primary route):")
+            lines.append(f"- {traffic_summary_primary}")
+            lines.append("")
+        if risk_text_primary:
+            lines.append(risk_text_primary)
+            lines.append("")
+        if actions_block:
+            lines.append(actions_block)
+            lines.append("")
 
-            recommended_block = (
-                "\nRecommended route (based on lowest risk, then shortest distance):\n"
-                f"- {best_name}: {miles:.1f} miles — Risk {label} ({score}/100); {expl}{fuel_best_suffix}\n"
-            )
+        # Toll block
+        lines.append(toll_block)
+        lines.append("")
 
-        # Driver-only ETA, fuel, and delta blocks
-        driver_block = ""
-        eta_weather_block = ""
-        fuel_block = ""
-        delta_block = ""
+        # Weather block
+        if weather_summary:
+            lines.append("Weather along route:")
+            lines.append(weather_summary)
+            lines.append("")
+        else:
+            lines.append("Weather along route:")
+            lines.append("- No weather details returned from service.")
+            lines.append("")
 
-        if self._mode == "driver" and miles_primary > 0 and self._avg_speed_mph > 0:
-            travel_hours = miles_primary / float(self._avg_speed_mph)
-
-            # Build timezone-aware departure datetime (local timezone)
-            try:
-                qd = self.depart_date_edit.date()
-                qt = self.depart_time_edit.time()
-                local_tz = datetime.now().astimezone().tzinfo
-                depart_dt = datetime(
-                    year=qd.year(),
-                    month=qd.month(),
-                    day=qd.day(),
-                    hour=qt.hour(),
-                    minute=qt.minute(),
-                    tzinfo=local_tz,
+        # Simple deltas: distance / time vs primary
+        if len(routes) > 1 and miles_list and minutes_list:
+            base_miles = miles_list[0]
+            base_minutes = minutes_list[0]
+            lines.append("Route deltas vs primary:")
+            for i in range(1, len(routes)):
+                dm = miles_list[i] - base_miles
+                dt = minutes_list[i] - base_minutes
+                dm_sign = "+" if dm >= 0 else "-"
+                dt_sign = "+" if dt >= 0 else "-"
+                lines.append(
+                    f"- Route {i + 1}: {dm_sign}{abs(dm):.1f} miles, {dt_sign}{abs(dt):.1f} minutes vs primary."
                 )
+            lines.append("")
+
+        # Driver ETA + fuel block
+        if self._mode == "driver" and miles_primary > 0:
+            try:
+                d = self.depart_date_edit.date()
+                t = self.depart_time_edit.time()
+                depart_dt = datetime(
+                    d.year(), d.month(), d.day(), t.hour(), t.minute()
+                )
+                if self._avg_speed_mph > 0:
+                    eta_hours = miles_primary / float(self._avg_speed_mph)
+                    eta_minutes_total = int(round(eta_hours * 60.0))
+                    eta_dt = depart_dt + timedelta(minutes=eta_minutes_total)
+
+                    eta_h = eta_minutes_total // 60
+                    eta_m = eta_minutes_total % 60
+                    eta_str = eta_dt.strftime("%Y-%m-%d %H:%M")
+
+                    lines.append("ETA driver planning (based on your settings):")
+                    lines.append(f"- Average speed: {self._avg_speed_mph} mph")
+                    lines.append(f"- Planned departure: {depart_dt.strftime('%Y-%m-%d %H:%M')}")
+                    lines.append(f"- Approx driving time at this speed: {eta_h}h {eta_m}m")
+                    lines.append(f"- Estimated arrival time: {eta_str}")
+                    lines.append("")
+
+                    # Prepare minimal ETA marker info for map icons
+                    self._eta_marker_info = {
+                        "midpoint": {
+                            "time": depart_dt + timedelta(minutes=eta_minutes_total // 2),
+                            "desc": "Midpoint ETA window",
+                        },
+                        "destination": {
+                            "time": eta_dt,
+                            "desc": "Destination ETA window",
+                        },
+                    }
             except Exception:
-                depart_dt = datetime.now().astimezone()
+                pass
 
-            eta_dt = depart_dt + timedelta(hours=travel_hours)
-            eta_str = eta_dt.strftime("%Y-%m-%d %H:%M")
-            eta_h = int(travel_hours)
-            eta_m = int(round((travel_hours - eta_h) * 60))
-            depart_str = depart_dt.strftime("%Y-%m-%d %H:%M")
-
-            driver_block = (
-                "\nDriver view (based on average speed):\n"
-                f"- Average speed: {self._avg_speed_mph} mph\n"
-                f"- Planned departure: {depart_str}\n"
-                f"- Approx driving time at this speed: {eta_h}h {eta_m}m\n"
-                f"- Estimated arrival time: {eta_str}\n"
-            )
-
-            # Fuel estimate for primary route (Driver mode)
             if self._mpg > 0 and self._fuel_price > 0:
                 gallons_primary = miles_primary / float(self._mpg)
                 cost_primary = gallons_primary * self._fuel_price
-                fuel_block = (
-                    "\nFuel estimate (driver planning):\n"
-                    f"- Truck MPG: {self._mpg} mpg\n"
-                    f"- Fuel price (est): ${self._fuel_price:.2f}/gal\n"
-                    f"- Estimated fuel used (primary): {gallons_primary:.1f} gal\n"
-                    f"- Estimated fuel cost (primary): ${cost_primary:.2f}\n"
-                )
-                if primary_cost_estimate is None:
-                    primary_cost_estimate = cost_primary
+                lines.append("Fuel estimate (driver planning):")
+                lines.append(f"- Truck MPG: {self._mpg} mpg")
+                lines.append(f"- Fuel price (est): ${self._fuel_price:.2f}/gal")
+                lines.append(f"- Estimated fuel used (primary): {gallons_primary:.1f} gal")
+                lines.append(f"- Estimated fuel cost (primary): ${cost_primary:.2f}")
+                lines.append("")
 
-            # Time-aligned weather forecast for Driver mode, if supported by ConditionsClient
-            try:
-                origin_lat = origin_lon = dest_lat = dest_lon = None
-                if isinstance(geom, dict) and isinstance(geom.get("coordinates"), list):
-                    coords = geom.get("coordinates") or []
-                    if len(coords) >= 2:
-                        o = coords[0]
-                        d = coords[-1]
-                        if isinstance(o, (list, tuple)) and len(o) == 2:
-                            origin_lon, origin_lat = float(o[0]), float(o[1])
-                        if isinstance(d, (list, tuple)) and len(d) == 2:
-                            dest_lon, dest_lat = float(d[0]), float(d[1])
+        # Overall risk posture
+        if primary_risk_score is not None:
+            if primary_risk_score >= 80:
+                lines.append("Overall risk posture: HIGH — consider delay, reroute, or extra caution.")
+            elif primary_risk_score >= 50:
+                lines.append("Overall risk posture: MODERATE — acceptable with standard caution.")
+            else:
+                lines.append("Overall risk posture: LOW — no extraordinary risk detected.")
+        else:
+            lines.append("Overall risk posture: UNKNOWN — insufficient risk data.")
+        lines.append("")
 
-                if (
-                    origin_lat is not None
-                    and origin_lon is not None
-                    and dest_lat is not None
-                    and dest_lon is not None
-                    and hasattr(ConditionsClient, "get_route_weather_with_eta")
-                ):
-                    conds = ConditionsClient()
-                    eta_midpoint = depart_dt + timedelta(hours=travel_hours / 2.0)
+        lines.append("Policy notes:")
+        lines.append("- This tool provides guidance only. Final route decisions remain with dispatch and driver.")
+        lines.append("- Always follow company policy, regulatory requirements, and real-time conditions.")
+        lines.append("")
+        lines.append(f"Conditions engine: {CONDITIONS_CLIENT_VERSION}")
+        lines.append("")
+        lines.append(f"Route Planner AI version: v{APP_VERSION}")
+        lines.append("")
 
-                    try:
-                        eta_weather_text = conds.get_route_weather_with_eta(
-                            origin_lat=origin_lat,
-                            origin_lon=origin_lon,
-                            dest_lat=dest_lat,
-                            dest_lon=dest_lon,
-                            eta_midpoint=eta_midpoint,
-                            eta_destination=eta_dt,
-                        )
-                    except ConditionsError as e:
-                        stamp = (
-                            f" [{CONDITIONS_CLIENT_VERSION}]"
-                            if CONDITIONS_CLIENT_VERSION
-                            else ""
-                        )
-                        eta_weather_text = (
-                            f"Time-aligned weather forecast unavailable{stamp}:\n{e}"
-                        )
+        return "\n".join(lines)
 
-                    # Store ETA marker info for map rendering (Driver mode map overlay)
-                    try:
-                        mid_desc = None
-                        dest_desc = None
-                        for line in (eta_weather_text or "").splitlines():
-                            line_stripped = line.strip()
-                            if line_stripped.startswith("- Midpoint ETA"):
-                                parts = line_stripped.split("):", 1)
-                                if len(parts) == 2:
-                                    mid_desc = parts[1].strip()
-                            elif line_stripped.startswith("- Destination ETA"):
-                                parts = line_stripped.split("):", 1)
-                                if len(parts) == 2:
-                                    dest_desc = parts[1].strip()
+    # -------------------------------------------------------------------------
+    # Stop management
+    # -------------------------------------------------------------------------
 
-                        self._eta_marker_info = {
-                            "midpoint": {
-                                "time": eta_midpoint,
-                                "desc": mid_desc or "",
-                            },
-                            "destination": {
-                                "time": eta_dt,
-                                "desc": dest_desc or "",
-                            },
-                        }
-                    except Exception:
-                        # Best-effort; do not break report if parsing fails
-                        self._eta_marker_info = None
+    def _add_stop_row(self) -> None:
+        row = StopRow(self._remove_stop_row)
+        self._stop_rows.append(row)
+        self.stops_layout.addWidget(row)
 
-                    eta_weather_block = "\n" + eta_weather_text + "\n"
+    def _remove_stop_row(self, row: StopRow) -> None:
+        if row in self._stop_rows:
+            self._stop_rows.remove(row)
+        row.setParent(None)
+        row.deleteLater()
 
-                else:
-                    eta_weather_block = ""
+    def _clear_all_stops(self) -> None:
+        for row in self._stop_rows:
+            row.setParent(None)
+            row.deleteLater()
+        self._stop_rows.clear()
 
-            except Exception as e:
-                stamp = (
-                    f" [{CONDITIONS_CLIENT_VERSION}]"
-                    if CONDITIONS_CLIENT_VERSION
-                    else ""
-                )
-                eta_weather_block = (
-                    f"\nTime-aligned weather forecast unavailable{stamp}:\n"
-                    f"{type(e).__name__}: {e}\n"
-                )
-
-            # Route delta block (vs primary), Driver mode only
-            if len(routes) > 1 and miles_primary > 0 and score_list:
-                primary_score_val = (
-                    primary_risk_score if primary_risk_score is not None else score_list[0]
-                )
-                delta_lines: List[str] = []
-                for idx in range(1, len(routes)):
-                    miles = miles_list[idx]
-                    minutes = minutes_list[idx]
-                    score = score_list[idx]
-
-                    dmiles = miles - miles_primary
-                    dmins = minutes - minutes_primary
-                    dscore = score - primary_score_val
-
-                    dmiles_str = f"{'+' if dmiles >= 0 else ''}{dmiles:.1f} mi"
-                    dmins_str = f"{'+' if dmins >= 0 else ''}{int(round(dmins))} min"
-                    dscore_str = f"{'+' if dscore >= 0 else ''}{dscore} risk"
-
-                    cost_delta_str = ""
-                    if (
-                        primary_cost_estimate is not None
-                        and idx < len(fuel_cost_list)
-                        and fuel_cost_list[idx] is not None
-                    ):
-                        dcost = fuel_cost_list[idx] - primary_cost_estimate
-                        cost_delta_str = f", {'+' if dcost >= 0 else ''}${dcost:.2f} fuel"
-
-                    # Route name for delta description
-                    if idx == 1:
-                        route_label = "Route 2 (Alternate)"
-                    else:
-                        route_label = f"Route {idx + 1}"
-
-                    delta_lines.append(
-                        f"- {route_label}: {dmiles_str}, {dmins_str}, {dscore_str}{cost_delta_str}"
-                    )
-
-                if delta_lines:
-                    delta_block = (
-                        "\nRoute deltas vs Route 1 (Primary):\n"
-                        + "\n".join(delta_lines)
-                        + "\n"
-                    )
-
-        conditions_ver = CONDITIONS_CLIENT_VERSION or "unknown"
-        policy_footer = (
-            "\n\nPolicy & System Context:\n"
-            "- Routing provider: OpenRouteService (ORS) directions (GeoJSON)\n"
-            "- ORS profile: driving-hgv\n"
-            "- Alternatives: dispatcher: disabled; driver: attempts provider alternatives if supported\n"
-            f"- Sanity threshold: {threshold}×\n"
-            "- Geocoding: ORS Pelias\n"
-            f"- Weather: Open-Meteo (ConditionsClient {conditions_ver})\n"
-            "- Traffic: TomTom Incident Details API (cached)\n"
-            "- Fuel modeling: driver-only; costs estimated from distance, MPG, and user fuel price\n"
-            f"- UI mode: {self._mode.upper()} | Avg speed: {self._avg_speed_mph} mph\n"
-        )
-
-        header = (
-            "=== DISPATCH REPORT ===\n"
-            f"Dispatch timestamp: {dispatch_timestamp}\n"
-            f"Route ID: {route_id}\n"
-            f"Trip type: {trip_type}\n"
-            "Vehicle profile: Truck (HGV)\n"
-            f"{sanity_line}\n"
-            "-----------------------------\n\n"
-        )
-
-        return (
-            header
-            + f"Route: {origin} \u2192 {destination}\n\n"
-            + "Primary route:\n"
-            + f"- Distance: {miles_primary:.1f} miles\n"
-            + f"- Estimated drive time: {hours_primary}h {mins_primary}m\n"
-            + f"- Geometry: {geometry_info}\n\n"
-            + toll_block
-            + "\n"
-            + f"{weather_summary}\n\n"
-            + f"{traffic_summary_primary}\n\n"
-            + f"{risk_text_primary}\n"
-            + (actions_block + "\n" if actions_block else "")
-            + driver_block
-            + fuel_block
-            + eta_weather_block
-            + recommended_block
-            + delta_block
-            + "\n"
-            + f"Route comparison summary for: {origin} \u2192 {destination}\n"
-            + "\n".join(route_lines)
-            + policy_footer
-        )
-
-    # -------------------------
-    # Clipboard
-    # -------------------------
+    # -------------------------------------------------------------------------
+    # Copy dispatch report
+    # -------------------------------------------------------------------------
 
     def _on_copy_clicked(self) -> None:
-        QApplication.clipboard().setText(self.conditions_text.toPlainText())
+        text = self.conditions_text.toPlainText()
+        if not text.strip():
+            return
+        QApplication.clipboard().setText(text)
+
+    # -------------------------------------------------------------------------
+    # Map helpers
+    # -------------------------------------------------------------------------
+
+    def _load_map(self) -> None:
+        self.map_view.setHtml(MAP_HTML, QUrl("about:blank"))
+
+    def _push_map(self, geometry: Dict[str, Any], markers: List[Dict[str, Any]]) -> None:
+        js = (
+            "window.renderRoute("
+            + json.dumps(geometry or {"type": "LineString", "coordinates": []})
+            + ", "
+            + json.dumps(markers or [])
+            + ");"
+        )
+        self.map_view.page().runJavaScript(js)
+
+
+# -----------------------------------------------------------------------------
+# Main entry
+# -----------------------------------------------------------------------------
+
+def main() -> int:
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

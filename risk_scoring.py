@@ -1,286 +1,255 @@
 from __future__ import annotations
 
-from typing import Tuple, List, Optional, Dict, Any
+from typing import List, Dict, Any, Tuple
 import re
 
 
-def _normalize_text(text: str) -> str:
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _normalize(text: str) -> str:
     return (text or "").lower()
+
+
+def _contains_any(text: str, needles: List[str]) -> bool:
+    t = _normalize(text)
+    return any(n in t for n in needles)
 
 
 def _extract_count(label: str, text: str) -> int:
     """
-    Extracts aggregated counts like:
-        'Road closed: 12'
-        'Accident: 4'
-        'Road works: 14'
-    Falls back to substring count if no numeric match is found.
+    Try to extract a numeric count for lines like:
+
+        "Road works: 14"
+        "Accident: 3"
+        "Closures: 2"
+
+    Falls back to 0 if no clear match.
     """
-    pattern = rf"{re.escape(label)}:\s*(\d+)"
-    match = re.search(pattern, text, flags=re.IGNORECASE)
-    if match:
+    pattern = rf"{re.escape(label)}\s*:\s*(\d+)"
+    m = re.search(pattern, text, flags=re.IGNORECASE)
+    if m:
         try:
-            return int(match.group(1))
+            return int(m.group(1))
         except ValueError:
-            pass
-
-    return text.lower().count(label.lower())
-
-
-def _extract_wind_kmh(weather_text: str) -> Optional[float]:
-    """
-    Attempts to parse wind speed from your standardized weather line format:
-        'wind 8 km/h'
-    Returns km/h if found.
-    """
-    m = re.search(r"wind\s+(\d+(?:\.\d+)?)\s*km\/h", weather_text, flags=re.IGNORECASE)
-    if not m:
-        return None
-    try:
-        return float(m.group(1))
-    except ValueError:
-        return None
+            return 0
+    return 0
 
 
-def _extract_temps_f(weather_text: str) -> List[float]:
-    """
-    Extract all Fahrenheit temps like:
-        '35.6°F'
-    Returns list of floats (may be empty).
-    """
-    temps: List[float] = []
-    for m in re.finditer(r"(-?\d+(?:\.\d+)?)\s*°f", weather_text, flags=re.IGNORECASE):
-        try:
-            temps.append(float(m.group(1)))
-        except ValueError:
-            continue
-    return temps
-
-
-def _has_precip_signal(weather_text: str) -> bool:
-    """
-    Heuristic: if the description includes precip-like terms.
-    Your current mapping uses: Drizzle, Rain, Snow, Rain showers, Thunderstorm.
-    """
-    wt = weather_text.lower()
-    return any(
-        k in wt
-        for k in (
-            "drizzle",
-            "rain",
-            "snow",
-            "showers",
-            "thunderstorm",
-            "sleet",
-            "freezing",
-        )
-    )
-
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def compute_route_risk(
     distance_miles: float,
     duration_minutes: float,
     weather_summary: str,
     traffic_summary: str,
-    traffic_stats: Optional[Dict[str, Any]] = None,
-) -> Tuple[int, str, str, List[str]]:
+    traffic_stats: Dict[str, Any] | None = None,
+) -> Tuple[int, str, str, List[str], Dict[str, Any]]:
     """
-    Returns: (score, label, explanation, actions)
+    ROUTE RISK INTERFACE v1.0
 
-    Backward compatibility note:
-      - This function previously returned (score, label, explanation).
-      - Your GUI should now unpack the 4th value (actions). If it doesn't,
-        you will see a "too many values to unpack" error.
+    Returns:
+        score       int   0–100 inclusive
+        label       str   "LOW" | "MODERATE" | "ELEVATED" | "HIGH"
+        explanation str   short natural-language summary of main drivers
+        actions     list  concrete dispatcher guidance lines
+        stats       dict  structured fields for future use
     """
 
-    weather_text = _normalize_text(weather_summary)
-    traffic_text = _normalize_text(traffic_summary)
-
-    score = 10  # baseline
-
-    # -------------------------------------------------------
-    # Distance / Duration
-    # -------------------------------------------------------
-    if distance_miles > 1200:
-        score += 20
-    elif distance_miles > 800:
-        score += 15
-    elif distance_miles > 400:
-        score += 8
-    elif distance_miles > 200:
-        score += 4
-
-    if duration_minutes > 18 * 60:
-        score += 12
-    elif duration_minutes > 12 * 60:
-        score += 8
-    elif duration_minutes > 8 * 60:
-        score += 5
-    elif duration_minutes > 4 * 60:
-        score += 3
-
-    # -------------------------------------------------------
-    # Weather
-    # -------------------------------------------------------
-    weather_factors: List[str] = []
-
-    if "heavy snow" in weather_text:
-        score += 25
-        weather_factors.append("heavy snow")
-    elif "moderate snow" in weather_text:
-        score += 15
-        weather_factors.append("moderate snow")
-    elif "snow" in weather_text:
-        score += 8
-        weather_factors.append("snow")
-
-    if "thunderstorm" in weather_text:
-        score += 20
-        weather_factors.append("thunderstorms")
-
-    if "heavy rain" in weather_text:
-        score += 15
-        weather_factors.append("heavy rain")
-    elif "moderate rain" in weather_text:
-        score += 8
-        weather_factors.append("moderate rain")
-
-    # Your current weather strings always include "wind X km/h"
-    # but we only escalate if wind is meaningful.
-    wind_kmh = _extract_wind_kmh(weather_summary)
-    if wind_kmh is not None:
-        # mild contribution at any wind mention (keeps your existing behavior)
-        if wind_kmh >= 0:
-            score += 3
-            weather_factors.append("wind")
-    else:
-        # fallback to old behavior if parsing fails
-        if "wind" in weather_text:
-            score += 3
-            weather_factors.append("wind")
-
-    # -------------------------------------------------------
-    # Traffic (aggregated counts)
-    # -------------------------------------------------------
-    traffic_factors: List[str] = []
-
-    closures = _extract_count("road closed", traffic_text)
-    accidents = _extract_count("accident", traffic_text)
-    roadworks = _extract_count("road works", traffic_text) + _extract_count("roadworks", traffic_text)
-
-    if closures > 0:
-        score += min(closures * 4, 30)
-        traffic_factors.append(f"{closures} closure(s)")
-
-    if accidents > 0:
-        score += min(accidents * 8, 24)
-        traffic_factors.append(f"{accidents} accident(s)")
-
-    if roadworks > 0:
-        score += min(roadworks * 3, 15)
-        traffic_factors.append(f"{roadworks} work zone(s)")
-
-    if "none reported" in traffic_text:
-        score -= 5
-
-    if "clear sky" in weather_text and not traffic_factors and not weather_factors:
-        score -= 5
-
-    # Clamp
-    score = max(0, min(100, score))
-
-    # -------------------------------------------------------
-    # Label
-    # -------------------------------------------------------
-    if score <= 30:
-        label = "LOW"
-    elif score <= 60:
-        label = "MODERATE"
-    elif score <= 80:
-        label = "ELEVATED"
-    else:
-        label = "HIGH"
-
-    # -------------------------------------------------------
-    # Explanation (existing behavior preserved)
-    # -------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Baseline from distance/time
+    # -----------------------------------------------------------------------
+    score = 0
     factors: List[str] = []
-
-    if distance_miles > 400:
-        factors.append("long-distance route")
-
-    if weather_factors:
-        # de-dupe but keep stable order
-        seen = set()
-        wf = []
-        for f in weather_factors:
-            if f not in seen:
-                seen.add(f)
-                wf.append(f)
-        factors.append("weather: " + ", ".join(wf))
-
-    if traffic_factors:
-        factors.append("traffic: " + ", ".join(traffic_factors))
-
-    if not factors:
-        factors.append("no significant issues detected")
-
-    explanation = "; ".join(factors)
-
-    # -------------------------------------------------------
-    # Actionable Guidance (NEW)
-    # -------------------------------------------------------
     actions: List[str] = []
 
-    # Buffer guidance by label + traffic
-    if label == "LOW":
-        actions.append("Add a 10–15 minute buffer for normal variability.")
-    elif label == "MODERATE":
-        actions.append("Add a 30–45 minute buffer and expect speed reductions in impacted zones.")
-    elif label == "ELEVATED":
-        actions.append("Add a 60+ minute buffer; consider delaying departure or selecting an alternate corridor if possible.")
-    else:  # HIGH
-        actions.append("Strongly consider delaying departure; add 90+ minutes buffer and evaluate alternate routing.")
+    miles = float(distance_miles or 0.0)
+    minutes = float(duration_minutes or 0.0)
+    hours = minutes / 60.0 if minutes > 0 else 0.0
 
-    if roadworks >= 10:
-        actions.append(f"Work zones are heavy ({roadworks}). Expect rolling slowdowns and lane shifts; increase following distance.")
-    elif roadworks >= 4:
-        actions.append(f"Multiple work zones ({roadworks}). Expect intermittent slowdowns and possible merges.")
-    elif roadworks > 0:
-        actions.append(f"Work zones present ({roadworks}). Remain alert for reduced speeds and sudden stops.")
+    if miles <= 0 or minutes <= 0:
+        # Degenerate; no distance/time → UNKNOWN but safe default
+        score = 0
+        factors.append("no distance/time information")
+    else:
+        # Long-haul baseline
+        if miles > 1000:
+            score += 15
+            factors.append("very long-distance route")
+        elif miles > 600:
+            score += 10
+            factors.append("long-distance route")
+        elif miles > 300:
+            score += 5
+            factors.append("moderate trip length")
 
-    if closures > 0:
-        actions.append(f"Closures detected ({closures}). Verify detours and check for last-minute reroutes before departure.")
-    if accidents > 0:
-        actions.append(f"Accidents detected ({accidents}). Expect localized congestion; plan a contingency stop or bypass.")
+        # Time-based fatigue baseline
+        if hours > 16:
+            score += 15
+            factors.append("very long drive window")
+        elif hours > 11:
+            score += 10
+            factors.append("extended drive window")
+        elif hours > 8:
+            score += 5
+            factors.append("full-shift drive window")
 
-    # Wind guidance (km/h thresholds are conservative; adjust later if you want)
-    if wind_kmh is not None:
-        if wind_kmh >= 45:
-            actions.append(f"High wind risk (≈{wind_kmh:.0f} km/h). Use crosswind precautions; consider delay if loaded light/high profile.")
-        elif wind_kmh >= 30:
-            actions.append(f"Moderate winds (≈{wind_kmh:.0f} km/h). Expect steering correction on exposed stretches; reduce speed as needed.")
-        elif wind_kmh >= 20:
-            actions.append(f"Noticeable winds (≈{wind_kmh:.0f} km/h). Monitor gusts on ridgelines and open plains.")
+    # -----------------------------------------------------------------------
+    # Weather analysis
+    # -----------------------------------------------------------------------
+    w = _normalize(weather_summary)
 
-    # Near-freezing precip advisory
-    temps_f = _extract_temps_f(weather_summary)
-    if temps_f:
-        min_temp = min(temps_f)
-        if min_temp <= 36.0 and _has_precip_signal(weather_summary):
-            actions.append(f"Near-freezing precipitation risk (min ≈{min_temp:.1f}°F). Watch for slick spots/black ice, especially bridges and shaded grades.")
+    heavy_snow = _contains_any(w, ["heavy snow", "blizzard"])
+    snow = heavy_snow or _contains_any(w, ["snow", "wintry mix", "sleet"])
+    ice = _contains_any(w, ["freezing rain", "black ice", "icy", "ice"])
+    fog = _contains_any(w, ["fog", "mist"])
+    heavy_rain = _contains_any(w, ["heavy rain", "downpour"])
+    rain = heavy_rain or _contains_any(w, ["rain", "showers", "drizzle"])
+    high_wind = _contains_any(w, ["wind 6", "wind 7", "gust", "gale", "strong wind"])
+    extreme_cold = _contains_any(w, ["-10", "-20", "dangerously cold", "arctic"])
+    extreme_heat = _contains_any(w, ["triple digit", "excessive heat", "heat advisory"])
 
-    # Traffic stats hook (if later you pass structured congestion)
+    if heavy_snow or ice:
+        score += 25
+        factors.append("severe winter conditions")
+        actions.append("Consider delay or reroute due to snow/ice risk.")
+        actions.append("Require chains and strict speed discipline if operating.")
+    elif snow:
+        score += 15
+        factors.append("winter precipitation on route")
+        actions.append("Increase following distance; plan lower cruise speeds.")
+    if fog:
+        score += 10
+        factors.append("visibility reduced by fog/mist")
+        actions.append("Increase spacing and avoid high-speed maneuvers in fog.")
+    if heavy_rain:
+        score += 10
+        factors.append("heavy rain / downpours")
+        actions.append("Watch for hydroplaning; expect reduced traction.")
+    elif rain:
+        score += 5
+        factors.append("wet road conditions")
+    if high_wind:
+        score += 10
+        factors.append("elevated crosswind risk")
+        actions.append("Use caution for high-profile trailers; avoid light loads in exposed corridors.")
+    if extreme_cold:
+        score += 5
+        factors.append("extreme cold (equipment/traction risk)")
+    if extreme_heat:
+        score += 5
+        factors.append("extreme heat (equipment/driver fatigue risk)")
+
+    # -----------------------------------------------------------------------
+    # Traffic incidents / road works
+    # -----------------------------------------------------------------------
+    t = traffic_summary or ""
+    t_norm = _normalize(t)
+
+    roadworks_count = _extract_count("Road works", t)
+    closures_count = _extract_count("Road closed", t) + _extract_count("Closure", t)
+    accident_count = _extract_count("Accident", t)
+
+    # If counts not explicitly present, approximate from text
+    if roadworks_count == 0 and "road works" in t_norm:
+        roadworks_count = 5
+    if closures_count == 0 and _contains_any(t_norm, ["road closed", "closure"]):
+        closures_count = 1
+    if accident_count == 0 and "accident" in t_norm:
+        accident_count = 1
+
+    if accident_count > 0:
+        score += min(20, 5 * accident_count)
+        factors.append(f"{accident_count} accident(s) reported near corridor")
+        actions.append("Check live feeds / ELD messages for major incidents before dispatch.")
+
+    if closures_count > 0:
+        score += min(20, 5 * closures_count)
+        factors.append(f"{closures_count} closure(s) / blocked segments")
+        actions.append("Verify detours; confirm route still legally/physically passable.")
+
+    if roadworks_count > 0:
+        if roadworks_count > 50:
+            score += 15
+            factors.append(f"heavy construction: ~{roadworks_count} work zones")
+        elif roadworks_count > 10:
+            score += 10
+            factors.append(f"moderate construction: ~{roadworks_count} work zones")
+        else:
+            score += 5
+            factors.append(f"light construction: ~{roadworks_count} work zones")
+        actions.append("Expect intermittent slowdowns and lane shifts in work zones.")
+
+    # -----------------------------------------------------------------------
+    # Optional structured traffic stats hook
+    # -----------------------------------------------------------------------
     if traffic_stats and isinstance(traffic_stats, dict):
-        # Placeholder: you can standardize fields later without changing GUI
-        pass
+        # Example: bump score a bit if provider reports heavy congestion
+        congestion_level = _normalize(str(traffic_stats.get("congestion_level", "")))
+        if "severe" in congestion_level:
+            score += 10
+            factors.append("severe congestion reported by traffic provider")
+        elif "moderate" in congestion_level:
+            score += 5
+            factors.append("moderate congestion reported by traffic provider")
 
-    # Final de-dupe while preserving order
-    seen_a = set()
+    # -----------------------------------------------------------------------
+    # Clamp, label, explanation
+    # -----------------------------------------------------------------------
+    score = max(0, min(int(round(score)), 100))
+
+    if score >= 80:
+        label = "HIGH"
+    elif score >= 60:
+        label = "ELEVATED"
+    elif score >= 40:
+        label = "MODERATE"
+    else:
+        label = "LOW"
+
+    if factors:
+        explanation = "; ".join(factors)
+    else:
+        explanation = "no significant risk factors detected"
+
+    # De-dupe actions while preserving order
+    seen: set[str] = set()
     actions_out: List[str] = []
     for a in actions:
-        if a not in seen_a:
-            seen_a.add(a)
+        if a not in seen:
+            seen.add(a)
             actions_out.append(a)
 
-    return score, label, explanation, actions_out
+    # -----------------------------------------------------------------------
+    # Stats payload for future dashboards / logging
+    # -----------------------------------------------------------------------
+    stats: Dict[str, Any] = {
+        "distance_miles": round(miles, 1),
+        "duration_minutes": round(minutes, 1),
+        "hours": round(hours, 2),
+        "weather": {
+            "heavy_snow": heavy_snow,
+            "snow": snow,
+            "ice": ice,
+            "fog": fog,
+            "heavy_rain": heavy_rain,
+            "rain": rain,
+            "high_wind": high_wind,
+            "extreme_cold": extreme_cold,
+            "extreme_heat": extreme_heat,
+        },
+        "traffic": {
+            "roadworks_count": roadworks_count,
+            "closures_count": closures_count,
+            "accident_count": accident_count,
+        },
+        "raw": {
+            "weather_summary": weather_summary,
+            "traffic_summary": traffic_summary,
+        },
+    }
+
+    return score, label, explanation, actions_out, stats
