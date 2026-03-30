@@ -18,6 +18,9 @@ from .models import (
 )
 
 
+# ----------------------------
+# ROUTE METRICS
+# ----------------------------
 def _compute_route_metrics(req: RouteRequest) -> Tuple[float, float, Dict[str, Any]]:
     client = RoutingClient(profile="driving-hgv")
 
@@ -51,27 +54,28 @@ def _compute_route_metrics(req: RouteRequest) -> Tuple[float, float, Dict[str, A
     return distance_miles, eta_hours, geometry
 
 
+# ----------------------------
+# CONDITIONS (stub)
+# ----------------------------
 def _compute_conditions(req: RouteRequest) -> ConditionsSummary:
-    alerts: List[str] = []
-
-    weather_summary = "Weather data not yet wired into API layer."
-    traffic_summary = "Traffic data not yet wired into API layer."
-
     return ConditionsSummary(
-        weather_summary=weather_summary,
-        traffic_summary=traffic_summary,
-        alerts=alerts,
+        weather_summary="Weather data not yet wired into API layer.",
+        traffic_summary="Traffic data not yet wired into API layer.",
+        alerts=[],
     )
 
 
+# ----------------------------
+# RISK (baseline)
+# ----------------------------
 def _compute_risk(
     req: RouteRequest,
     distance_miles: float,
     conditions: ConditionsSummary,
 ) -> Tuple[float, str, List[RiskComponent]]:
+
     risk_score = 10.0
     risk_band = "LOW"
-    components: List[RiskComponent] = []
 
     if risk_score < 33:
         risk_band = "LOW"
@@ -80,79 +84,126 @@ def _compute_risk(
     else:
         risk_band = "HIGH"
 
-    return risk_score, risk_band, components
+    return risk_score, risk_band, []
 
 
-# 🔥 NEW — smarter explanation engine
+# ----------------------------
+# NEW — STATE DETECTION
+# ----------------------------
+def _extract_states(req: RouteRequest) -> List[str]:
+    text = f"{req.origin} {req.destination}".lower()
+
+    states_map = {
+        "mt": "MT",
+        "id": "ID",
+        "wy": "WY",
+        "nd": "ND",
+        "sd": "SD",
+        "mn": "MN",
+        "wi": "WI",
+        "il": "IL",
+        "wa": "WA",
+        "or": "OR",
+        "ca": "CA",
+        "co": "CO",
+    }
+
+    found = []
+    for key, val in states_map.items():
+        if key in text:
+            found.append(val)
+
+    return list(dict.fromkeys(found))  # dedupe preserve order
+
+
+# ----------------------------
+# NEW — CORRIDOR DETECTION
+# ----------------------------
+def _detect_corridor(states: List[str]) -> str:
+    if {"MT", "ND", "MN", "WI", "IL"}.issubset(set(states)):
+        return "Northern freight corridor (I-90 / I-94)"
+    if {"CA", "AZ", "TX"}.intersection(states):
+        return "Southern corridor (I-10 / I-40 patterns)"
+    return "Mixed regional highway network"
+
+
+# ----------------------------
+# 🔥 UPGRADED EXPLANATION ENGINE
+# ----------------------------
 def _build_route_explanation(
     req: RouteRequest,
     distance_miles: float,
     eta_hours: float,
     risk_band: str,
 ) -> str:
+
     hours = int(eta_hours)
     minutes = int((eta_hours - hours) * 60)
+    time_str = f"{hours}h {minutes}m"
 
-    time_str = f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
+    states = _extract_states(req)
+    corridor = _detect_corridor(states)
 
-    # --- Region classification (simple but effective)
-    origin = req.origin.lower()
-    destination = req.destination.lower()
+    # Terrain logic
+    terrain_start = "mountain terrain early" if "MT" in states or "ID" in states else "mixed terrain early"
+    terrain_end = "flatter midwest terrain approaching destination" if "IL" in states else "mixed terrain late"
 
-    if "mt" in origin or "id" in origin or "wy" in origin:
-        terrain_start = "mountain terrain early"
-    else:
-        terrain_start = "mixed terrain early"
+    # Wind / exposure
+    wind_note = "high crosswind exposure across plains" if "ND" in states or "SD" in states else "normal wind exposure"
 
-    if "il" in destination or "in" in destination or "oh" in destination:
-        terrain_end = "flatter midwest terrain approaching destination"
-    else:
-        terrain_end = "mixed terrain approaching destination"
+    # Urban pressure
+    urban_note = ""
+    if "IL" in states:
+        urban_note = "heavy traffic congestion approaching Chicago"
 
-    # --- Corridor logic (very simple v1)
-    if "mt" in origin and "il" in destination:
-        corridor = "northern corridor (I-90 / I-94 style routing)"
-        wind_note = "exposed plains sections with potential crosswinds"
-    else:
-        corridor = "standard cross-country corridor"
-        wind_note = "normal wind exposure"
+    # Risk text
+    risk_text = {
+        "LOW": "low operational risk",
+        "MEDIUM": "moderate operational risk",
+        "HIGH": "elevated operational risk",
+    }[risk_band]
 
-    # --- Risk text
-    if risk_band == "LOW":
-        risk_text = "low overall operational risk"
-    elif risk_band == "MEDIUM":
-        risk_text = "moderate operational risk"
-    else:
-        risk_text = "elevated operational risk"
+    states_str = " → ".join(states) if states else "multi-state route"
 
     return (
-        f"{int(distance_miles)} miles (~{time_str}). "
-        f"Follows {corridor}. "
-        f"{terrain_start}, transitioning to {terrain_end}. "
-        f"{wind_note}. "
-        f"Overall: {risk_text}."
+        f"{int(distance_miles)} miles (~{time_str})\n\n"
+        f"Corridor:\n- {corridor}\n\n"
+        f"States:\n- {states_str}\n\n"
+        f"Driver Notes:\n"
+        f"- {terrain_start}\n"
+        f"- {terrain_end}\n"
+        f"- {wind_note}\n"
+        f"{f'- {urban_note}\n' if urban_note else ''}"
+        f"\nOverall: {risk_text}"
     )
 
 
+# ----------------------------
+# ACTION
+# ----------------------------
 def _derive_recommended_action(
     mode: str,
     risk_band: str,
     conditions: ConditionsSummary,
 ) -> str:
+
     if mode == "dispatcher":
         if risk_band == "LOW":
-            return "Route acceptable. Monitor conditions, but no changes required."
+            return "Route acceptable."
         if risk_band == "MEDIUM":
-            return "Moderate risk. Consider adjusting departure time or route in coordination with driver."
-        return "High risk. Re-evaluate route and timing before dispatch."
+            return "Monitor conditions and consider adjustments."
+        return "Re-evaluate route before dispatch."
 
     if risk_band == "LOW":
-        return "Good to go. Drive with normal caution."
+        return "Good to go."
     if risk_band == "MEDIUM":
-        return "Conditions mixed. Stay alert and be prepared for delays."
-    return "Elevated risk. Coordinate with dispatch before departure or continuing."
+        return "Stay alert."
+    return "Coordinate with dispatch."
 
 
+# ----------------------------
+# MAIN ENTRY
+# ----------------------------
 def plan_route(req: RouteRequest) -> RouteResponse:
     distance_miles, eta_hours, geometry = _compute_route_metrics(req)
     conditions = _compute_conditions(req)
@@ -163,13 +214,6 @@ def plan_route(req: RouteRequest) -> RouteResponse:
         conditions=conditions,
     )
 
-    recommended_action = _derive_recommended_action(
-        mode=req.mode,
-        risk_band=risk_band,
-        conditions=conditions,
-    )
-
-    # 🔥 smarter explanation
     explanation = _build_route_explanation(
         req=req,
         distance_miles=distance_miles,
@@ -192,9 +236,11 @@ def plan_route(req: RouteRequest) -> RouteResponse:
         distance_miles=distance_miles,
         eta_hours=eta_hours,
         risk_score=risk_score,
-        risk_band=risk_band,  # type: ignore[arg-type]
+        risk_band=risk_band,
         conditions=conditions,
-        recommended_action=recommended_action,
+        recommended_action=_derive_recommended_action(
+            req.mode, risk_band, conditions
+        ),
         risk_components=risk_components,
         meta=meta,
     )
