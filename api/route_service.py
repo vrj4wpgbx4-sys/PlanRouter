@@ -6,6 +6,7 @@ RoutePlanner service layer.
 from __future__ import annotations
 
 from dataclasses import asdict
+import re
 from typing import Tuple, List, Dict, Any
 
 from routing_client import RoutingClient, RoutingError
@@ -73,7 +74,6 @@ def _compute_risk(
     distance_miles: float,
     conditions: ConditionsSummary,
 ) -> Tuple[float, str, List[RiskComponent]]:
-
     risk_score = 10.0
     risk_band = "LOW"
 
@@ -88,47 +88,193 @@ def _compute_risk(
 
 
 # ----------------------------
-# NEW — STATE DETECTION
+# LOCATION / STATE HELPERS
 # ----------------------------
-def _extract_states(req: RouteRequest) -> List[str]:
-    text = f"{req.origin} {req.destination}".lower()
+_STATE_ALIASES: Dict[str, str] = {
+    "alabama": "AL",
+    "al": "AL",
+    "alaska": "AK",
+    "ak": "AK",
+    "arizona": "AZ",
+    "az": "AZ",
+    "arkansas": "AR",
+    "ar": "AR",
+    "california": "CA",
+    "ca": "CA",
+    "colorado": "CO",
+    "co": "CO",
+    "connecticut": "CT",
+    "ct": "CT",
+    "delaware": "DE",
+    "de": "DE",
+    "florida": "FL",
+    "fl": "FL",
+    "georgia": "GA",
+    "ga": "GA",
+    "idaho": "ID",
+    "id": "ID",
+    "illinois": "IL",
+    "il": "IL",
+    "indiana": "IN",
+    "in": "IN",
+    "iowa": "IA",
+    "ia": "IA",
+    "kansas": "KS",
+    "ks": "KS",
+    "kentucky": "KY",
+    "ky": "KY",
+    "louisiana": "LA",
+    "la": "LA",
+    "maine": "ME",
+    "me": "ME",
+    "maryland": "MD",
+    "md": "MD",
+    "massachusetts": "MA",
+    "ma": "MA",
+    "michigan": "MI",
+    "mi": "MI",
+    "minnesota": "MN",
+    "mn": "MN",
+    "mississippi": "MS",
+    "ms": "MS",
+    "missouri": "MO",
+    "mo": "MO",
+    "montana": "MT",
+    "mt": "MT",
+    "nebraska": "NE",
+    "ne": "NE",
+    "nevada": "NV",
+    "nv": "NV",
+    "new hampshire": "NH",
+    "nh": "NH",
+    "new jersey": "NJ",
+    "nj": "NJ",
+    "new mexico": "NM",
+    "nm": "NM",
+    "new york": "NY",
+    "ny": "NY",
+    "north carolina": "NC",
+    "nc": "NC",
+    "north dakota": "ND",
+    "nd": "ND",
+    "ohio": "OH",
+    "oh": "OH",
+    "oklahoma": "OK",
+    "ok": "OK",
+    "oregon": "OR",
+    "or": "OR",
+    "pennsylvania": "PA",
+    "pa": "PA",
+    "rhode island": "RI",
+    "ri": "RI",
+    "south carolina": "SC",
+    "sc": "SC",
+    "south dakota": "SD",
+    "sd": "SD",
+    "tennessee": "TN",
+    "tn": "TN",
+    "texas": "TX",
+    "tx": "TX",
+    "utah": "UT",
+    "ut": "UT",
+    "vermont": "VT",
+    "vt": "VT",
+    "virginia": "VA",
+    "va": "VA",
+    "washington": "WA",
+    "wa": "WA",
+    "west virginia": "WV",
+    "wv": "WV",
+    "wisconsin": "WI",
+    "wi": "WI",
+    "wyoming": "WY",
+    "wy": "WY",
+}
 
-    states_map = {
-        "mt": "MT",
-        "id": "ID",
-        "wy": "WY",
-        "nd": "ND",
-        "sd": "SD",
-        "mn": "MN",
-        "wi": "WI",
-        "il": "IL",
-        "wa": "WA",
-        "or": "OR",
-        "ca": "CA",
-        "co": "CO",
-    }
+_NORTHERN_STATE_ORDER = ["WA", "ID", "MT", "ND", "MN", "WI", "IL"]
+_CENTRAL_STATE_ORDER = ["WA", "OR", "ID", "MT", "WY", "SD", "MN", "WI", "IL"]
+_SOUTHERN_STATE_ORDER = ["CA", "AZ", "NM", "TX", "OK", "AR", "TN", "NC"]
 
-    found = []
-    for key, val in states_map.items():
-        if key in text:
-            found.append(val)
 
-    return list(dict.fromkeys(found))  # dedupe preserve order
+def _extract_state_from_location(location_text: str) -> str | None:
+    text = location_text.strip().lower()
+
+    # Prefer the last comma-separated segment, e.g. "Chicago, IL"
+    parts = [p.strip() for p in text.split(",") if p.strip()]
+    candidates = []
+
+    if parts:
+        candidates.append(parts[-1])
+
+    candidates.append(text)
+
+    for candidate in candidates:
+        candidate = re.sub(r"\s+", " ", candidate).strip()
+
+        if candidate in _STATE_ALIASES:
+            return _STATE_ALIASES[candidate]
+
+        # Match exact two-letter token only, not substrings inside words like Chicago
+        match = re.search(r"\b([a-z]{2})\b$", candidate)
+        if match:
+            token = match.group(1)
+            if token in _STATE_ALIASES:
+                return _STATE_ALIASES[token]
+
+    return None
+
+
+def _infer_state_path(origin_state: str | None, destination_state: str | None) -> List[str]:
+    if not origin_state or not destination_state:
+        return [s for s in [origin_state, destination_state] if s]
+
+    if origin_state == destination_state:
+        return [origin_state]
+
+    northern_positions = {s: i for i, s in enumerate(_NORTHERN_STATE_ORDER)}
+    if origin_state in northern_positions and destination_state in northern_positions:
+        start = northern_positions[origin_state]
+        end = northern_positions[destination_state]
+        lo, hi = sorted((start, end))
+        path = _NORTHERN_STATE_ORDER[lo : hi + 1]
+        return path if start <= end else list(reversed(path))
+
+    central_positions = {s: i for i, s in enumerate(_CENTRAL_STATE_ORDER)}
+    if origin_state in central_positions and destination_state in central_positions:
+        start = central_positions[origin_state]
+        end = central_positions[destination_state]
+        lo, hi = sorted((start, end))
+        path = _CENTRAL_STATE_ORDER[lo : hi + 1]
+        return path if start <= end else list(reversed(path))
+
+    southern_positions = {s: i for i, s in enumerate(_SOUTHERN_STATE_ORDER)}
+    if origin_state in southern_positions and destination_state in southern_positions:
+        start = southern_positions[origin_state]
+        end = southern_positions[destination_state]
+        lo, hi = sorted((start, end))
+        path = _SOUTHERN_STATE_ORDER[lo : hi + 1]
+        return path if start <= end else list(reversed(path))
+
+    return [origin_state, destination_state]
 
 
 # ----------------------------
-# NEW — CORRIDOR DETECTION
+# CORRIDOR DETECTION
 # ----------------------------
 def _detect_corridor(states: List[str]) -> str:
-    if {"MT", "ND", "MN", "WI", "IL"}.issubset(set(states)):
+    state_set = set(states)
+
+    if {"MT", "ND", "MN", "WI", "IL"}.issubset(state_set):
         return "Northern freight corridor (I-90 / I-94)"
-    if {"CA", "AZ", "TX"}.intersection(states):
+    if {"CA", "AZ", "NM", "TX"}.issubset(state_set):
         return "Southern corridor (I-10 / I-40 patterns)"
+    if {"MT", "SD", "MN", "WI", "IL"}.issubset(state_set):
+        return "Northern-central corridor (I-90 patterns)"
     return "Mixed regional highway network"
 
 
 # ----------------------------
-# 🔥 UPGRADED EXPLANATION ENGINE
+# EXPLANATION ENGINE
 # ----------------------------
 def _build_route_explanation(
     req: RouteRequest,
@@ -136,27 +282,37 @@ def _build_route_explanation(
     eta_hours: float,
     risk_band: str,
 ) -> str:
-
     hours = int(eta_hours)
     minutes = int((eta_hours - hours) * 60)
     time_str = f"{hours}h {minutes}m"
 
-    states = _extract_states(req)
+    origin_state = _extract_state_from_location(req.origin)
+    destination_state = _extract_state_from_location(req.destination)
+    states = _infer_state_path(origin_state, destination_state)
     corridor = _detect_corridor(states)
 
-    # Terrain logic
-    terrain_start = "mountain terrain early" if "MT" in states or "ID" in states else "mixed terrain early"
-    terrain_end = "flatter midwest terrain approaching destination" if "IL" in states else "mixed terrain late"
+    terrain_start = (
+        "mountain terrain early"
+        if origin_state in {"MT", "ID", "WY", "CO", "UT"}
+        else "mixed terrain early"
+    )
 
-    # Wind / exposure
-    wind_note = "high crosswind exposure across plains" if "ND" in states or "SD" in states else "normal wind exposure"
+    terrain_end = (
+        "flatter midwest terrain approaching destination"
+        if destination_state in {"IL", "IN", "OH", "WI", "MN", "IA"}
+        else "mixed terrain late"
+    )
 
-    # Urban pressure
+    wind_note = (
+        "high crosswind exposure across plains"
+        if any(state in {"ND", "SD", "WY", "MT", "NE"} for state in states)
+        else "normal wind exposure"
+    )
+
     urban_note = ""
-    if "IL" in states:
+    if destination_state == "IL":
         urban_note = "heavy traffic congestion approaching Chicago"
 
-    # Risk text
     risk_text = {
         "LOW": "low operational risk",
         "MEDIUM": "moderate operational risk",
@@ -165,17 +321,27 @@ def _build_route_explanation(
 
     states_str = " → ".join(states) if states else "multi-state route"
 
-    return (
-        f"{int(distance_miles)} miles (~{time_str})\n\n"
-        f"Corridor:\n- {corridor}\n\n"
-        f"States:\n- {states_str}\n\n"
-        f"Driver Notes:\n"
-        f"- {terrain_start}\n"
-        f"- {terrain_end}\n"
-        f"- {wind_note}\n"
-        f"{f'- {urban_note}\n' if urban_note else ''}"
-        f"\nOverall: {risk_text}"
-    )
+    lines = [
+        f"{int(distance_miles)} miles (~{time_str})",
+        "",
+        "Corridor:",
+        f"- {corridor}",
+        "",
+        "States:",
+        f"- {states_str}",
+        "",
+        "Driver Notes:",
+        f"- {terrain_start}",
+        f"- {terrain_end}",
+        f"- {wind_note}",
+    ]
+
+    if urban_note:
+        lines.append(f"- {urban_note}")
+
+    lines.extend(["", f"Overall: {risk_text}"])
+
+    return "\n".join(lines)
 
 
 # ----------------------------
@@ -186,7 +352,6 @@ def _derive_recommended_action(
     risk_band: str,
     conditions: ConditionsSummary,
 ) -> str:
-
     if mode == "dispatcher":
         if risk_band == "LOW":
             return "Route acceptable."
@@ -230,6 +395,8 @@ def plan_route(req: RouteRequest) -> RouteResponse:
         "vehicle_profile": req.vehicle_profile,
         "geometry": geometry,
         "explanation": explanation,
+        "origin_state": origin_state if False else _extract_state_from_location(req.origin),
+        "destination_state": destination_state if False else _extract_state_from_location(req.destination),
     }
 
     return RouteResponse(
