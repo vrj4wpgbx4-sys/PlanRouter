@@ -8,7 +8,6 @@ from __future__ import annotations
 import re
 from typing import Tuple, List, Dict, Any
 
-# 🔥 FIXED IMPORT (Render-safe)
 from ..routing_client import RoutingClient, RoutingError
 
 from .models import (
@@ -48,7 +47,7 @@ def _compute_route_metrics(req: RouteRequest) -> Tuple[float, float, Dict[str, A
 
     distance_miles = float(summary.get("distance_miles") or 0.0)
     if distance_miles <= 0:
-        raise RoutingError("Routing returned zero distance for primary route.")
+        raise RoutingError("Routing returned zero distance.")
 
     avg_speed = req.avg_speed_mph if req.avg_speed_mph > 0 else 1.0
     eta_hours = distance_miles / avg_speed
@@ -61,8 +60,8 @@ def _compute_route_metrics(req: RouteRequest) -> Tuple[float, float, Dict[str, A
 # ----------------------------
 def _compute_conditions(req: RouteRequest) -> ConditionsSummary:
     return ConditionsSummary(
-        weather_summary="Weather data not yet wired into API layer.",
-        traffic_summary="Traffic data not yet wired into API layer.",
+        weather_summary="Weather not integrated yet.",
+        traffic_summary="Traffic not integrated yet.",
         alerts=[],
     )
 
@@ -96,23 +95,51 @@ def _extract_highways(segments: List[Dict[str, Any]]) -> List[str]:
 
 
 # ----------------------------
-# STATE HELPERS
+# STATE INFERENCE FROM HIGHWAYS
 # ----------------------------
-def _extract_state_from_location(location_text: str) -> str | None:
-    parts = [p.strip() for p in location_text.split(",") if p.strip()]
-    if parts:
-        last = parts[-1]
-        if len(last) == 2:
-            return last.upper()
-    return None
+HIGHWAY_STATE_MAP = {
+    "I-90": ["MT", "WY", "SD", "MN", "WI", "IL"],
+    "I-94": ["MT", "ND", "MN", "WI", "IL"],
+    "I-35": ["TX", "OK", "KS", "MO", "IA", "MN"],
+    "I-39": ["IL", "WI"],
+    "I-694": ["MN"],
+}
 
 
-def _infer_state_path(origin_state: str | None, destination_state: str | None) -> List[str]:
-    if origin_state and destination_state:
-        if origin_state == destination_state:
-            return [origin_state]
-        return [origin_state, destination_state]
-    return []
+def _infer_states_from_highways(highways: List[str]) -> List[str]:
+    states = []
+
+    for h in highways:
+        mapped = HIGHWAY_STATE_MAP.get(h, [])
+        for s in mapped:
+            if s not in states:
+                states.append(s)
+
+    return states
+
+
+# ----------------------------
+# DRIVER NOTES ENGINE
+# ----------------------------
+def _build_driver_notes(highways: List[str], states: List[str]) -> List[str]:
+    notes = []
+
+    if any(h in ["I-90", "I-94"] for h in highways):
+        notes.append("northern corridor freight route")
+
+    if "MT" in states:
+        notes.append("mountain terrain early")
+
+    if any(s in ["ND", "SD", "WY"] for s in states):
+        notes.append("high crosswind exposure across plains")
+
+    if "IL" in states:
+        notes.append("heavy traffic congestion approaching Chicago")
+
+    if not notes:
+        notes.append("standard highway conditions")
+
+    return notes
 
 
 # ----------------------------
@@ -123,6 +150,7 @@ def _build_route_explanation(
     eta_hours: float,
     highways: List[str],
     states: List[str],
+    notes: List[str],
     risk_band: str,
 ) -> str:
 
@@ -132,10 +160,13 @@ def _build_route_explanation(
     highways_str = ", ".join(highways) if highways else "regional highways"
     states_str = " → ".join(states) if states else "multi-state route"
 
+    notes_str = "\n".join(f"- {n}" for n in notes)
+
     return (
         f"{int(distance_miles)} miles (~{hours}h {minutes}m)\n\n"
         f"Primary Highways:\n- {highways_str}\n\n"
         f"States:\n- {states_str}\n\n"
+        f"Driver Notes:\n{notes_str}\n\n"
         f"Overall: {risk_band.lower()} operational risk"
     )
 
@@ -169,16 +200,15 @@ def plan_route(req: RouteRequest) -> RouteResponse:
     )
 
     highways = _extract_highways(segments)
-
-    origin_state = _extract_state_from_location(req.origin)
-    destination_state = _extract_state_from_location(req.destination)
-    states = _infer_state_path(origin_state, destination_state)
+    states = _infer_states_from_highways(highways)
+    notes = _build_driver_notes(highways, states)
 
     explanation = _build_route_explanation(
         distance_miles,
         eta_hours,
         highways,
         states,
+        notes,
         risk_band,
     )
 
@@ -188,6 +218,7 @@ def plan_route(req: RouteRequest) -> RouteResponse:
         "geometry": geometry,
         "highways": highways,
         "states": states,
+        "driver_notes": notes,
         "explanation": explanation,
     }
 
