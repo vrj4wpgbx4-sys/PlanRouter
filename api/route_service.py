@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 from typing import Tuple, List, Dict, Any
 
-from ..routing_client import RoutingClient, RoutingError
+from routing_client import RoutingClient, RoutingError
 
 from .models import (
     RouteRequest,
@@ -80,24 +80,28 @@ def _compute_risk(
 # ----------------------------
 # HIGHWAY EXTRACTION
 # ----------------------------
+HIGHWAY_PATTERN = re.compile(r"\bI[- ]?\d+\b", re.IGNORECASE)
+
 def _extract_highways(segments: List[Dict[str, Any]]) -> List[str]:
-    highways = set()
+    highways: List[str] = []
 
     for seg in segments:
         for step in seg.get("steps", []):
-            instruction = step.get("instruction", "")
-            matches = re.findall(r"\bI[- ]?\d+\b", instruction)
+            instruction = str(step.get("instruction", "") or "")
+            matches = HIGHWAY_PATTERN.findall(instruction)
 
-            for m in matches:
-                highways.add(m.replace(" ", "-").upper())
+            for match in matches:
+                normalized = match.upper().replace(" ", "-")
+                if normalized not in highways:
+                    highways.append(normalized)
 
-    return sorted(highways)
+    return highways
 
 
 # ----------------------------
 # STATE INFERENCE FROM HIGHWAYS
 # ----------------------------
-HIGHWAY_STATE_MAP = {
+HIGHWAY_STATE_MAP: Dict[str, List[str]] = {
     "I-90": ["MT", "WY", "SD", "MN", "WI", "IL"],
     "I-94": ["MT", "ND", "MN", "WI", "IL"],
     "I-35": ["TX", "OK", "KS", "MO", "IA", "MN"],
@@ -107,13 +111,12 @@ HIGHWAY_STATE_MAP = {
 
 
 def _infer_states_from_highways(highways: List[str]) -> List[str]:
-    states = []
+    states: List[str] = []
 
-    for h in highways:
-        mapped = HIGHWAY_STATE_MAP.get(h, [])
-        for s in mapped:
-            if s not in states:
-                states.append(s)
+    for highway in highways:
+        for state in HIGHWAY_STATE_MAP.get(highway, []):
+            if state not in states:
+                states.append(state)
 
     return states
 
@@ -122,15 +125,15 @@ def _infer_states_from_highways(highways: List[str]) -> List[str]:
 # DRIVER NOTES ENGINE
 # ----------------------------
 def _build_driver_notes(highways: List[str], states: List[str]) -> List[str]:
-    notes = []
+    notes: List[str] = []
 
-    if any(h in ["I-90", "I-94"] for h in highways):
+    if any(h in {"I-90", "I-94"} for h in highways):
         notes.append("northern corridor freight route")
 
     if "MT" in states:
         notes.append("mountain terrain early")
 
-    if any(s in ["ND", "SD", "WY"] for s in states):
+    if any(s in {"ND", "SD", "WY", "MT", "NE"} for s in states):
         notes.append("high crosswind exposure across plains")
 
     if "IL" in states:
@@ -153,14 +156,12 @@ def _build_route_explanation(
     notes: List[str],
     risk_band: str,
 ) -> str:
-
     hours = int(eta_hours)
     minutes = int((eta_hours - hours) * 60)
 
     highways_str = ", ".join(highways) if highways else "regional highways"
     states_str = " → ".join(states) if states else "multi-state route"
-
-    notes_str = "\n".join(f"- {n}" for n in notes)
+    notes_str = "\n".join(f"- {note}" for note in notes)
 
     return (
         f"{int(distance_miles)} miles (~{hours}h {minutes}m)\n\n"
@@ -204,12 +205,12 @@ def plan_route(req: RouteRequest) -> RouteResponse:
     notes = _build_driver_notes(highways, states)
 
     explanation = _build_route_explanation(
-        distance_miles,
-        eta_hours,
-        highways,
-        states,
-        notes,
-        risk_band,
+        distance_miles=distance_miles,
+        eta_hours=eta_hours,
+        highways=highways,
+        states=states,
+        notes=notes,
+        risk_band=risk_band,
     )
 
     meta = {
@@ -229,7 +230,9 @@ def plan_route(req: RouteRequest) -> RouteResponse:
         risk_band=risk_band,
         conditions=conditions,
         recommended_action=_derive_recommended_action(
-            req.mode, risk_band, conditions
+            req.mode,
+            risk_band,
+            conditions,
         ),
         risk_components=risk_components,
         meta=meta,
