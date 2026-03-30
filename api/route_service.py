@@ -83,8 +83,9 @@ def _compute_risk(
     return risk_score, risk_band, components
 
 
-# NEW — explanation engine
+# 🔥 NEW — smarter explanation engine
 def _build_route_explanation(
+    req: RouteRequest,
     distance_miles: float,
     eta_hours: float,
     risk_band: str,
@@ -94,16 +95,42 @@ def _build_route_explanation(
 
     time_str = f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
 
-    if risk_band == "LOW":
-        risk_text = "low overall risk"
-    elif risk_band == "MEDIUM":
-        risk_text = "moderate risk conditions"
+    # --- Region classification (simple but effective)
+    origin = req.origin.lower()
+    destination = req.destination.lower()
+
+    if "mt" in origin or "id" in origin or "wy" in origin:
+        terrain_start = "mountain terrain early"
     else:
-        risk_text = "elevated risk conditions"
+        terrain_start = "mixed terrain early"
+
+    if "il" in destination or "in" in destination or "oh" in destination:
+        terrain_end = "flatter midwest terrain approaching destination"
+    else:
+        terrain_end = "mixed terrain approaching destination"
+
+    # --- Corridor logic (very simple v1)
+    if "mt" in origin and "il" in destination:
+        corridor = "northern corridor (I-90 / I-94 style routing)"
+        wind_note = "exposed plains sections with potential crosswinds"
+    else:
+        corridor = "standard cross-country corridor"
+        wind_note = "normal wind exposure"
+
+    # --- Risk text
+    if risk_band == "LOW":
+        risk_text = "low overall operational risk"
+    elif risk_band == "MEDIUM":
+        risk_text = "moderate operational risk"
+    else:
+        risk_text = "elevated operational risk"
 
     return (
-        f"Approx. {int(distance_miles)} miles, {time_str} travel time. "
-        f"Route currently shows {risk_text}."
+        f"{int(distance_miles)} miles (~{time_str}). "
+        f"Follows {corridor}. "
+        f"{terrain_start}, transitioning to {terrain_end}. "
+        f"{wind_note}. "
+        f"Overall: {risk_text}."
     )
 
 
@@ -142,8 +169,9 @@ def plan_route(req: RouteRequest) -> RouteResponse:
         conditions=conditions,
     )
 
-    # NEW explanation
+    # 🔥 smarter explanation
     explanation = _build_route_explanation(
+        req=req,
         distance_miles=distance_miles,
         eta_hours=eta_hours,
         risk_band=risk_band,
@@ -157,7 +185,7 @@ def plan_route(req: RouteRequest) -> RouteResponse:
         "avg_speed_mph": req.avg_speed_mph,
         "vehicle_profile": req.vehicle_profile,
         "geometry": geometry,
-        "explanation": explanation,  # NEW
+        "explanation": explanation,
     }
 
     return RouteResponse(
