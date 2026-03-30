@@ -19,12 +19,6 @@ from .models import (
 
 
 def _compute_route_metrics(req: RouteRequest) -> Tuple[float, float, Dict[str, Any]]:
-    """
-    Returns:
-      - distance_miles
-      - eta_hours
-      - geometry dict from the primary route
-    """
     client = RoutingClient(profile="driving-hgv")
 
     if req.stops:
@@ -89,6 +83,30 @@ def _compute_risk(
     return risk_score, risk_band, components
 
 
+# NEW — explanation engine
+def _build_route_explanation(
+    distance_miles: float,
+    eta_hours: float,
+    risk_band: str,
+) -> str:
+    hours = int(eta_hours)
+    minutes = int((eta_hours - hours) * 60)
+
+    time_str = f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
+
+    if risk_band == "LOW":
+        risk_text = "low overall risk"
+    elif risk_band == "MEDIUM":
+        risk_text = "moderate risk conditions"
+    else:
+        risk_text = "elevated risk conditions"
+
+    return (
+        f"Approx. {int(distance_miles)} miles, {time_str} travel time. "
+        f"Route currently shows {risk_text}."
+    )
+
+
 def _derive_recommended_action(
     mode: str,
     risk_band: str,
@@ -124,6 +142,13 @@ def plan_route(req: RouteRequest) -> RouteResponse:
         conditions=conditions,
     )
 
+    # NEW explanation
+    explanation = _build_route_explanation(
+        distance_miles=distance_miles,
+        eta_hours=eta_hours,
+        risk_band=risk_band,
+    )
+
     meta = {
         "origin": req.origin,
         "destination": req.destination,
@@ -132,6 +157,7 @@ def plan_route(req: RouteRequest) -> RouteResponse:
         "avg_speed_mph": req.avg_speed_mph,
         "vehicle_profile": req.vehicle_profile,
         "geometry": geometry,
+        "explanation": explanation,  # NEW
     }
 
     return RouteResponse(
