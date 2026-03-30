@@ -5,11 +5,11 @@ RoutePlanner service layer.
 
 from __future__ import annotations
 
-from dataclasses import asdict
 import re
 from typing import Tuple, List, Dict, Any
 
-from routing_client import RoutingClient, RoutingError
+# 🔥 FIXED IMPORT (Render-safe)
+from ..routing_client import RoutingClient, RoutingError
 
 from .models import (
     RouteRequest,
@@ -79,7 +79,7 @@ def _compute_risk(
 
 
 # ----------------------------
-# 🔥 HIGHWAY EXTRACTION
+# HIGHWAY EXTRACTION
 # ----------------------------
 def _extract_highways(segments: List[Dict[str, Any]]) -> List[str]:
     highways = set()
@@ -87,27 +87,23 @@ def _extract_highways(segments: List[Dict[str, Any]]) -> List[str]:
     for seg in segments:
         for step in seg.get("steps", []):
             instruction = step.get("instruction", "")
-
             matches = re.findall(r"\bI[- ]?\d+\b", instruction)
+
             for m in matches:
-                normalized = m.replace(" ", "-")
-                highways.add(normalized.upper())
+                highways.add(m.replace(" ", "-").upper())
 
     return sorted(highways)
 
 
 # ----------------------------
-# STATE HELPERS (keep existing)
+# STATE HELPERS
 # ----------------------------
 def _extract_state_from_location(location_text: str) -> str | None:
-    text = location_text.strip().lower()
-    parts = [p.strip() for p in text.split(",") if p.strip()]
-
+    parts = [p.strip() for p in location_text.split(",") if p.strip()]
     if parts:
         last = parts[-1]
         if len(last) == 2:
             return last.upper()
-
     return None
 
 
@@ -120,7 +116,7 @@ def _infer_state_path(origin_state: str | None, destination_state: str | None) -
 
 
 # ----------------------------
-# 🔥 NEW EXPLANATION ENGINE
+# EXPLANATION ENGINE
 # ----------------------------
 def _build_route_explanation(
     distance_miles: float,
