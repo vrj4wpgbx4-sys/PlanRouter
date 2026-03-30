@@ -54,6 +54,22 @@ def health_check() -> dict:
     return {"status": "ok"}
 
 
+def build_route_explanation(meta: dict, risk_band: str) -> str:
+    origin = meta.get("origin", "Unknown origin")
+    destination = meta.get("destination", "Unknown destination")
+
+    base = f"This route runs from {origin} to {destination}."
+
+    if risk_band == "LOW":
+        risk_text = "Overall conditions are favorable with minimal risk."
+    elif risk_band == "MEDIUM":
+        risk_text = "Moderate risk expected. Stay alert for changing conditions."
+    else:
+        risk_text = "High risk route. Extra caution and planning required."
+
+    return f"{base} {risk_text}"
+
+
 @app.post("/api/route-plan", response_model=APIRouteResponse)
 def route_plan(body: APIRouteRequest) -> APIRouteResponse:
     stops = [Stop(location=s) for s in body.stops]
@@ -69,7 +85,14 @@ def route_plan(body: APIRouteRequest) -> APIRouteResponse:
     )
 
     resp = plan_route(internal_req)
-    geometry = resp.meta.get("geometry", {}) if isinstance(resp.meta, dict) else {}
+
+    # --- Ensure meta exists ---
+    meta = resp.meta if isinstance(resp.meta, dict) else {}
+
+    # --- Inject explanation ---
+    meta["explanation"] = build_route_explanation(meta, resp.risk_band)
+
+    geometry = meta.get("geometry", {})
 
     return APIRouteResponse(
         distance_miles=resp.distance_miles,
@@ -81,6 +104,6 @@ def route_plan(body: APIRouteRequest) -> APIRouteResponse:
         alerts=resp.conditions.alerts,
         recommended_action=resp.recommended_action,
         risk_components=[rc.__dict__ for rc in resp.risk_components],
-        meta=resp.meta,
+        meta=meta,
         geometry=geometry,
     )
